@@ -13,7 +13,24 @@ function now() {
   return new Date().toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
 }
 
+function cleanupOldLogs() {
+  if (!fs.existsSync(LOG_FILE)) return;
+  const content = fs.readFileSync(LOG_FILE, 'utf-8');
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const lines = content.split('\n');
+  const kept = lines.filter(line => {
+    const m = line.match(/^\[(\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2}:\d{2})\]/);
+    if (!m) return true;
+    const d = new Date(m[1]);
+    return !isNaN(d) && d.getTime() > weekAgo;
+  });
+  if (kept.length !== lines.length) {
+    fs.writeFileSync(LOG_FILE, kept.join('\n'), 'utf-8');
+  }
+}
+
 function writeLog(level, message) {
+  cleanupOldLogs();
   const line = `[${now()}] [${level}] ${message}\n`;
   const old = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf-8') : '';
   fs.writeFileSync(LOG_FILE, line + old, 'utf-8');
