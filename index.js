@@ -648,13 +648,21 @@ async function syncMode() {
 
     const recentFiles = filterByHours(allFiles, shareHours);
     const minSizeMB = config.minFileSizeMB || 0;
-    const largeFiles = minSizeMB > 0
+    let largeFiles = minSizeMB > 0
       ? recentFiles.filter(f => (f.size || 0) >= minSizeMB * 1048576)
       : recentFiles;
     if (minSizeMB > 0) {
       log(`   过滤 <${minSizeMB}MB 文件: 剩余 ${largeFiles.length} 个\n`);
     }
-    log(`   最近 ${shareHours} 小时更新的文件: ${recentFiles.length} 个\n`);
+
+    const maxPerShare = config.maxFilesPerShare || 0;
+    let capped = false;
+    if (maxPerShare > 0 && largeFiles.length > maxPerShare) {
+      largeFiles = [...largeFiles].sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0)).slice(0, maxPerShare);
+      capped = true;
+    }
+    log(`   最近 ${shareHours} 小时更新的文件: ${recentFiles.length} 个` +
+      (capped ? ` → 限制取最新 ${maxPerShare} 个` : '') + '\n');
 
     if (largeFiles.length === 0) {
       log('没有找到符合条件的文件，无需转存。');
@@ -1082,9 +1090,14 @@ async function runSync(config) {
       const recentFiles = filterByHours(allFiles, shareHours);
 
       const minSizeMB = config.minFileSizeMB || 0;
-      const largeFiles = minSizeMB > 0
+      let largeFiles = minSizeMB > 0
         ? recentFiles.filter(f => (f.size || 0) >= minSizeMB * 1048576)
         : recentFiles;
+
+      const maxPerShare = config.maxFilesPerShare || 0;
+      if (maxPerShare > 0 && largeFiles.length > maxPerShare) {
+        largeFiles = [...largeFiles].sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0)).slice(0, maxPerShare);
+      }
 
       if (largeFiles.length === 0) continue;
       const existingMap = await client.getExistingFileMap(dirFid);
