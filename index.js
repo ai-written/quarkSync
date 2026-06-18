@@ -6,7 +6,6 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-
 const LOG_FILE = path.join(__dirname, 'sync.log');
 
 function now() {
