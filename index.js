@@ -90,6 +90,27 @@ function cleanupLocalFiles(saveDir, maxAgeDays) {
   return { deleted, skipped };
 }
 
+function acquireLock(lockName, lockDir) {
+  const lockFile = path.join(lockDir, lockName);
+  if (fs.existsSync(lockFile)) {
+    let pid;
+    try { pid = parseInt(fs.readFileSync(lockFile, 'utf-8').trim(), 10); } catch { pid = 0; }
+    if (pid) {
+      try {
+        process.kill(pid, 0);
+        logError(`检测到另一个进程 (PID: ${pid}) 正在 "${lockName}" 中运行，已退出。`);
+        process.exit(0);
+      } catch {}
+    }
+    try { fs.unlinkSync(lockFile); } catch {}
+  }
+  fs.writeFileSync(lockFile, String(process.pid), 'utf-8');
+  const release = () => { try { fs.unlinkSync(lockFile); } catch {} };
+  process.once('exit', release);
+  process.once('SIGINT', () => { release(); process.exit(0); });
+  process.once('SIGTERM', () => { release(); process.exit(0); });
+}
+
 function loadConfig() {
   const configPath = path.join(__dirname, 'config.json');
   if (!fs.existsSync(configPath)) {
@@ -760,6 +781,9 @@ async function syncMode() {
 async function downloadMode(forceDownload = false) {
   const config = loadConfig();
   const client = new QuarkClient(config.cookie);
+  const saveDir = path.resolve(config.downloadDir || '.');
+  if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+  acquireLock('.download.lock', saveDir);
 
   log('=== 夸克网盘下载到本地 ===\n');
 
@@ -772,8 +796,6 @@ async function downloadMode(forceDownload = false) {
 
   log('1. 确定目标文件夹...');
   const targetDirFid = await client.resolveTargetDir(config);
-  const saveDir = path.resolve(config.downloadDir || '.');
-  if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
   log(`   保存到: ${saveDir}\n`);
 
   log('2. 开始下载...');
@@ -963,6 +985,7 @@ async function alistMode(forceDownload = false) {
   const alistPath = config.alistPath || '/kuake/来自：分享';
   const saveDir = path.resolve(config.downloadDir || '.');
   if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+  acquireLock('.alist.lock', saveDir);
 
   log('=== AList 下载到本地 ===\n');
   log(`AList: ${alistUrl}`);
