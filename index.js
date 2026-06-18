@@ -6,10 +6,11 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+
 const LOG_FILE = path.join(__dirname, 'sync.log');
 
 function now() {
-  return new Date().toLocaleString('zh-CN', { hour12: false });
+  return new Date().toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
 }
 
 function writeLog(level, message) {
@@ -648,7 +649,12 @@ class AlistClient {
   }
 
   async listAllFiles(dirPath) {
-    const { content, total } = await this.listDir(dirPath);
+    const data = await this.listDir(dirPath);
+    const content = Array.isArray(data.content) ? data.content : [];
+    if (!Array.isArray(data.content)) {
+      log(`   ⚠ AList 路径 "${dirPath}" 返回异常: ${JSON.stringify(data).substring(0, 200)}`);
+    }
+    const total = data.total || 0;
     const files = [];
     for (const item of content) {
       if (item.is_dir) {
@@ -660,7 +666,8 @@ class AlistClient {
     }
     if (total > content.length) {
       const more = await this.listDir(dirPath, 2, total);
-      for (const item of more.content) {
+      const moreContent = Array.isArray(more.content) ? more.content : [];
+      for (const item of moreContent) {
         if (item.is_dir) {
           const sub = await this.listAllFiles(`${dirPath}/${item.name}`);
           files.push(...sub);
