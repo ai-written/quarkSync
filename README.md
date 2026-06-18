@@ -33,7 +33,7 @@ cp config.example.json config.json
 ### 配置项说明
 
 | 字段 | 类型 | 必填 | 说明 |
-|---|---|---|
+| --- | --- | --- | --- |
 | `cookie` | string | 是 | 夸克网盘登录后的完整 Cookie 字符串 |
 | `shareUrls` | array | 是 | 分享链接列表，每项包含 `url`（链接）、`password`（提取码，可选）、`tip`（文件名前缀，可选）、`hours`（时间窗口覆盖全局，可选） |
 | `shareUrl` | string | 否 | 单个分享链接（与 `shareUrls` 二选一） |
