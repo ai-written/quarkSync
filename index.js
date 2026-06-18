@@ -612,7 +612,8 @@ async function syncMode() {
     }
     log(`时间范围: 最近 ${hours} 小时更新\n`);
 
-    log('2. 获取分享 token...');
+    try {
+    log(`2. 获取分享 token (${pwdId})...`);
     const stoken = await client.getShareToken(pwdId, passcode);
     log('   ✓ 获取成功\n');
 
@@ -727,6 +728,11 @@ async function syncMode() {
     totalFailed += results.failed.length;
     allSuccess.push(...renamedNames);
     allFailed.push(...results.failed);
+    } catch (e) {
+      logError(`   ✗ 处理分享失败 ${shareTip ? `(${shareTip}) ` : ''}- ${e.message}`);
+      totalFailed++;
+      continue;
+    }
   }
 
   if (shareUrls.length > 1) {
@@ -1038,47 +1044,52 @@ async function runSync(config) {
     const shareTip = tip || config.tip;
     const pwdId = parseShareUrl(url);
     const passcode = password || config.password || '';
-    const stoken = await client.getShareToken(pwdId, passcode);
-    const allFiles = await client.listAllShareFiles(pwdId, stoken);
-    const recentFiles = filterByHours(allFiles, hours);
-    if (recentFiles.length === 0) continue;
-    const existingMap = await client.getExistingFileMap(dirFid);
-    const newFiles = recentFiles.filter(f => {
-      const key = `${f.file_name}|${f.size || ''}`;
-      if (existingMap.has(key)) return false;
-      if (shareTip) {
-        const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
-        if (existingMap.has(`${prefix}${f.file_name}|${f.size || ''}`)) return false;
-      }
-      return true;
-    });
-    if (newFiles.length === 0) continue;
-    const results = await client.saveFilesInBatches(pwdId, stoken, newFiles, dirFid, pollInterval);
-    let renamedNames = results.success;
-    if (shareTip && results.success.length > 0) {
-      renamedNames = [];
-      await new Promise(r => setTimeout(r, 2000));
-      const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
-      let existingFiles = await client.listAllUserFiles(dirFid);
-      let existingNames = new Set(existingFiles.map(f => f.file_name));
-      for (const name of results.success) {
-        const newName = `${prefix}${name}`;
-        if (existingNames.has(newName)) { renamedNames.push(newName); continue; }
-        let match = existingFiles.find(f => f.file_name === name);
-        if (!match) {
-          await new Promise(r => setTimeout(r, 1000));
-          existingFiles = await client.listAllUserFiles(dirFid);
-          existingNames = new Set(existingFiles.map(f => f.file_name));
-          match = existingFiles.find(f => f.file_name === name);
+    try {
+      const stoken = await client.getShareToken(pwdId, passcode);
+      const allFiles = await client.listAllShareFiles(pwdId, stoken);
+      const recentFiles = filterByHours(allFiles, hours);
+      if (recentFiles.length === 0) continue;
+      const existingMap = await client.getExistingFileMap(dirFid);
+      const newFiles = recentFiles.filter(f => {
+        const key = `${f.file_name}|${f.size || ''}`;
+        if (existingMap.has(key)) return false;
+        if (shareTip) {
+          const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
+          if (existingMap.has(`${prefix}${f.file_name}|${f.size || ''}`)) return false;
         }
-        if (!match) { renamedNames.push(name); continue; }
-        try { await client.renameFile(match.fid, newName); renamedNames.push(newName); } catch { renamedNames.push(name); }
+        return true;
+      });
+      if (newFiles.length === 0) continue;
+      const results = await client.saveFilesInBatches(pwdId, stoken, newFiles, dirFid, pollInterval);
+      let renamedNames = results.success;
+      if (shareTip && results.success.length > 0) {
+        renamedNames = [];
+        await new Promise(r => setTimeout(r, 2000));
+        const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
+        let existingFiles = await client.listAllUserFiles(dirFid);
+        let existingNames = new Set(existingFiles.map(f => f.file_name));
+        for (const name of results.success) {
+          const newName = `${prefix}${name}`;
+          if (existingNames.has(newName)) { renamedNames.push(newName); continue; }
+          let match = existingFiles.find(f => f.file_name === name);
+          if (!match) {
+            await new Promise(r => setTimeout(r, 1000));
+            existingFiles = await client.listAllUserFiles(dirFid);
+            existingNames = new Set(existingFiles.map(f => f.file_name));
+            match = existingFiles.find(f => f.file_name === name);
+          }
+          if (!match) { renamedNames.push(name); continue; }
+          try { await client.renameFile(match.fid, newName); renamedNames.push(newName); } catch { renamedNames.push(name); }
+        }
       }
+      totalSuccess += results.success.length;
+      totalFailed += results.failed.length;
+      allSuccess.push(...renamedNames);
+      allFailed.push(...results.failed);
+    } catch (e) {
+      logError(`   ✗ 处理分享 "${url}" ${shareTip ? `(${shareTip}) ` : ''}失败: ${e.message}`);
+      continue;
     }
-    totalSuccess += results.success.length;
-    totalFailed += results.failed.length;
-    allSuccess.push(...renamedNames);
-    allFailed.push(...results.failed);
   }
   log(`   同步完成: 成功 ${totalSuccess} 失败 ${totalFailed}`);
   if (allSuccess.length > 0) {
