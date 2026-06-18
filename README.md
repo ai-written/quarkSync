@@ -5,11 +5,14 @@
 ## 功能
 
 - **自动转存** — 监控多个夸克网盘分享链接，将最近更新的文件自动转存到自己的网盘
-- **过滤去重** — 按更新时间窗口过滤，按“文件名+大小”自动去重，避免重复转存
+- **过滤去重** — 按更新时间窗口过滤，按"文件名+大小"自动去重，避免重复转存
+- **小文件过滤** — 支持按文件大小下限过滤（`minFileSizeMB`），小于指定 MB 的文件不转存
+- **数量限制** — 支持每分享链接最多转存 N 条最新文件（`maxFilesPerShare`）
 - **文件重命名** — 支持为转存文件添加前缀（如 `遮天-`、`斗破苍穹-`），便于分类管理
 - **定时调度** — 支持 cron 表达式定时执行同步和下载任务
 - **夸克下载** — 将夸克网盘指定文件夹的文件下载到本地
 - **AList 下载** — 支持从 AList 服务器下载文件到本地
+- **进程锁** — download/alist 模式自动加锁，防止并发执行导致文件损坏
 
 ## 安装
 
@@ -30,13 +33,15 @@ cp config.example.json config.json
 ### 配置项说明
 
 | 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
+|---|---|---|---|---|
 | `cookie` | string | 是 | 夸克网盘登录后的完整 Cookie 字符串 |
-| `shareUrls` | array | 是 | 分享链接列表，每项包含 `url`（链接）、`password`（提取码，可选）、`tip`（文件名前缀，可选） |
+| `shareUrls` | array | 是 | 分享链接列表，每项包含 `url`（链接）、`password`（提取码，可选）、`tip`（文件名前缀，可选）、`hours`（时间窗口覆盖全局，可选） |
 | `shareUrl` | string | 否 | 单个分享链接（与 `shareUrls` 二选一） |
 | `password` | string | 否 | 默认提取码 |
 | `tip` | string | 否 | 默认文件名前缀 |
 | `hours` | int | 否 | 时间窗口（小时），只转存该时间范围内的文件，默认 48 |
+| `minFileSizeMB` | int | 否 | 最小文件大小过滤（MB），小于此值的文件不转存，默认 0 不过滤 |
+| `maxFilesPerShare` | int | 否 | 每分享最多转存文件数，按更新时间倒序取最新 N 条，默认 0 不限制 |
 | `targetDirName` | string | 否 | 转存目标文件夹名称，默认 `来自：分享` |
 | `targetDirFid` | string | 否 | 转存目标文件夹 ID（优先级高于 targetDirName） |
 | `downloadDir` | string | 否 | 本地下载目录路径 |
@@ -64,12 +69,15 @@ cp config.example.json config.json
 {
   "cookie": "你的夸克Cookie字符串",
   "hours": 3,
+  "minFileSizeMB": 100,
+  "maxFilesPerShare": 3,
   "targetDirName": "来自：分享",
   "shareUrls": [
     {
       "url": "https://pan.quark.cn/s/xxxxxxxx",
       "password": "提取码",
-      "tip": "遮天-"
+      "tip": "遮天-",
+      "hours": 6
     },
     {
       "url": "https://pan.quark.cn/s/yyyyyyyy",
@@ -167,11 +175,13 @@ Cron 配置示例：
 
 ### 同步模式
 1. 加载 `config.json` 并验证 Cookie 有效性
-2. 遍历 `shareUrls` 中的每个分享链接，获取目录树
-3. 筛选出 `hours` 时间窗口内更新的文件
-4. 与目标文件夹已有文件比对去重（按文件名 + 文件大小）
-5. 分批（每批 20 个）将新文件转存到目标文件夹
-6. 若配置了 `tip` 前缀，自动重命名转存后的文件
+2. 遍历 `shareUrls` 中的每个分享链接，获取目录树（失效链接自动跳过）
+3. 筛选出 `hours` 时间窗口内更新的文件（可每个链接单独配置）
+4. 按 `minFileSizeMB` 过滤掉过小的文件
+5. 按 `maxFilesPerShare` 限制数量，只保留更新时间最新的 N 条
+6. 与目标文件夹已有文件比对去重（按文件名 + 文件大小）
+7. 分批（每批 20 个）将新文件转存到目标文件夹
+8. 若配置了 `tip` 前缀，自动重命名转存后的文件
 
 ### 下载模式
 1. 列出网盘目标文件夹中的所有文件
