@@ -43,6 +43,7 @@ cp config.example.json config.json
 | `deleteAfterDownload` | bool | 否 | 下载后是否删除云盘文件 |
 | `alistUrl` | string | 否 | AList 服务器地址 |
 | `alistPath` | string | 否 | AList 下载路径 |
+| `alistRefresh` | bool | 否 | AList 列出文件时是否绕过缓存（需管理员权限），默认 false |
 | `alistToken` | string | 否 | AList 认证 Token |
 | `syncCron` | string | 否 | 同步任务的 cron 表达式 |
 | `alistCron` | string | 否 | AList 下载任务的 cron 表达式 |
@@ -101,6 +102,16 @@ npm run download
 node index.js download
 ```
 
+下载后会生成 `.downloaded.json` 记录已下载文件（按文件名+大小），下次运行时自动跳过已下载文件，防止重复下载。
+
+如需强制重新下载所有文件，添加 `--force-download` 参数：
+
+```bash
+npm run download-force
+# 或
+node index.js download --force-download
+```
+
 ### AList 模式
 
 从 AList 服务器下载文件到本地：
@@ -109,6 +120,14 @@ node index.js download
 npm run alist
 # 或
 node index.js alist
+```
+
+同样支持 `--force-download` 强制重新下载：
+
+```bash
+npm run alist-force
+# 或
+node index.js alist --force-download
 ```
 
 ### 定时调度模式
@@ -134,12 +153,20 @@ Cron 配置示例：
 
 ## 工作流程
 
+### 同步模式
 1. 加载 `config.json` 并验证 Cookie 有效性
 2. 遍历 `shareUrls` 中的每个分享链接，获取目录树
 3. 筛选出 `hours` 时间窗口内更新的文件
 4. 与目标文件夹已有文件比对去重（按文件名 + 文件大小）
 5. 分批（每批 20 个）将新文件转存到目标文件夹
 6. 若配置了 `tip` 前缀，自动重命名转存后的文件
+
+### 下载模式
+1. 列出网盘目标文件夹中的所有文件
+2. 从 `.downloaded.json` 加载已下载记录，跳过已完成的文件（按文件名+大小匹配）
+3. 分批（每批 10 个）获取下载地址，并行下载（并发 3 个）
+4. 每个文件下载成功后立即写入 `.downloaded.json`，即使中途中断也不会重复下载
+5. 若启用 `deleteAfterDownload`，下载后从网盘删除文件
 
 ## 日志
 

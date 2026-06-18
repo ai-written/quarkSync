@@ -8,7 +8,9 @@
     "start": "node index.js",
     "sync": "node index.js",
     "download": "node index.js download",
+    "download-force": "node index.js download --force-download",
     "alist": "node index.js alist",
+    "alist-force": "node index.js alist --force-download",
     "schedule": "node index.js schedule"
   },
   "license": "MIT",

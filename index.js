@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const LOG_FILE = path.join(__dirname, 'sync.log');
+const DOWNLOADED_FILE = '.downloaded.json';
 
 function now() {
   return new Date().toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
@@ -29,6 +30,21 @@ function logError(message) {
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.71 Safari/537.36 Core/1.94.225.400 QQBrowser/12.2.5544.400';
 const UA_CLIENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.56 Chrome/100.0.4896.160 Electron/18.3.5.12-a038f7b798 Safari/537.36 Channel/pckk_other_ch';
+
+function loadDownloadedRecord(saveDir) {
+  const fp = path.join(saveDir, DOWNLOADED_FILE);
+  try {
+    if (fs.existsSync(fp)) {
+      return new Map(Object.entries(JSON.parse(fs.readFileSync(fp, 'utf-8'))));
+    }
+  } catch {}
+  return new Map();
+}
+
+function saveDownloadedRecord(saveDir, record) {
+  const fp = path.join(saveDir, DOWNLOADED_FILE);
+  fs.writeFileSync(fp, JSON.stringify(Object.fromEntries(record), null, 2), 'utf-8');
+}
 
 function loadConfig() {
   const configPath = path.join(__dirname, 'config.json');
@@ -276,21 +292,21 @@ class QuarkClient {
 
   async downloadFilesParallel(downloadUrls, saveDir, concurrency = 3) {
     const queue = [...downloadUrls];
-    const successFids = [];
+    const success = [];
     const worker = async () => {
       while (queue.length > 0) {
         const item = queue.shift();
         const savePath = path.join(saveDir, item.file_name);
         try {
           await this.downloadFile(item.download_url, savePath);
-          successFids.push(item.fid);
+          success.push({ fid: item.fid, file_name: item.file_name, size: item.size });
         } catch (e) {
           log(`   ✗ ${item.file_name} 下载失败: ${e.message}`);
         }
       }
     };
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
-    return successFids;
+    return success;
   }
 
   async downloadAllFromFolder(pdirFid, saveDir, skipExisting = true, deleteAfter = false) {
@@ -298,16 +314,18 @@ class QuarkClient {
     const files = await this.listAllUserFiles(pdirFid);
     log(`   ✓ 共 ${files.length} 个文件\n`);
 
+    const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
     const toDownload = skipExisting
-      ? files.filter(f => !fs.existsSync(path.join(saveDir, f.file_name)))
+      ? files.filter(f => !downloadedRecord.has(`${f.file_name}|${f.size || ''}`))
       : files;
 
     if (toDownload.length === 0) {
-      log(`   所有文件已存在本地，无需下载。`);
+      log(`   所有文件已下载过，无需下载。`);
       return;
     }
 
-    log(`   待下载: ${toDownload.length} 个 (已跳过 ${files.length - toDownload.length} 个已存在的)\n`);
+    const skipped = files.length - toDownload.length;
+    log(`   待下载: ${toDownload.length} 个 (跳过 ${skipped} 个已下载记录)\n`);
 
     const batchSize = 10;
     let downloaded = 0;
@@ -323,9 +341,15 @@ class QuarkClient {
         log(`   ✗ 获取下载地址失败 (${range}): ${e.message}`);
         continue;
       }
-      const successFids = await this.downloadFilesParallel(urls, saveDir, 3);
-      downloaded += successFids.length;
-      downloadedFids.push(...successFids);
+      const success = await this.downloadFilesParallel(urls, saveDir, 3);
+      downloaded += success.length;
+      downloadedFids.push(...success.map(s => s.fid));
+      if (skipExisting) {
+        for (const s of success) {
+          downloadedRecord.set(`${s.file_name}|${s.size || ''}`, true);
+        }
+        saveDownloadedRecord(saveDir, downloadedRecord);
+      }
     }
     log(`\n   下载完成: ${downloaded}/${toDownload.length} 个`);
 
@@ -605,7 +629,7 @@ async function syncMode() {
   }
 }
 
-async function downloadMode() {
+async function downloadMode(forceDownload = false) {
   const config = loadConfig();
   const client = new QuarkClient(config.cookie);
 
@@ -625,18 +649,30 @@ async function downloadMode() {
   log(`   保存到: ${saveDir}\n`);
 
   log('2. 开始下载...');
-  await client.downloadAllFromFolder(targetDirFid, saveDir, true, config.deleteAfterDownload);
+  const skipExisting = !forceDownload;
+  await client.downloadAllFromFolder(targetDirFid, saveDir, skipExisting, config.deleteAfterDownload);
 }
 
 class AlistClient {
-  constructor(baseUrl) {
+  constructor(baseUrl, token = '', refresh = false) {
     this.base = baseUrl.replace(/\/$/, '');
+    this.token = token;
+    this._wantRefresh = refresh;
+    this._refreshOk = true;
   }
 
   async _post(path, body = {}) {
     const url = `${this.base}/api/${path}`;
-    const resp = await axios.post(url, body, { timeout: 30000, validateStatus: () => true });
+    const headers = { 'Content-Type': 'application/json' };
+    if (this.token) headers['Authorization'] = this.token;
+    const resp = await axios.post(url, body, { headers, timeout: 30000, validateStatus: () => true });
     const d = resp.data;
+    if (d.code === 403 && body.refresh && this._refreshOk) {
+      log('   ⚠ 无权限刷新缓存，后续请求将使用缓存数据');
+      this._refreshOk = false;
+      delete body.refresh;
+      return this._post(path, body);
+    }
     if (d.code !== 200) {
       throw new Error(`AList API [${d.code}]: ${d.message || JSON.stringify(d)}`);
     }
@@ -644,7 +680,7 @@ class AlistClient {
   }
 
   async listDir(dirPath, page = 1, perPage = 0) {
-    return this._post('fs/list', { path: dirPath, password: '', page, per_page: perPage, refresh: false });
+    return this._post('fs/list', { path: dirPath, password: '', page, per_page: perPage, refresh: this._refreshOk && this._wantRefresh });
   }
 
   async listAllFiles(dirPath) {
@@ -725,16 +761,18 @@ class AlistClient {
     const files = await this.listAllFiles(alistPath);
     log(`   ✓ 共 ${files.length} 个文件\n`);
 
+    const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
     const toDownload = skipExisting
-      ? files.filter(f => !fs.existsSync(path.join(saveDir, f.name)))
+      ? files.filter(f => !downloadedRecord.has(`${f.name}|${f.size || ''}`))
       : files;
 
     if (toDownload.length === 0) {
-      log(`   所有文件已存在本地，无需下载。`);
+      log(`   所有文件已下载过，无需下载。`);
       return;
     }
 
-    log(`   待下载: ${toDownload.length}/${files.length} 个\n`);
+    const skipped = files.length - toDownload.length;
+    log(`   待下载: ${toDownload.length}/${files.length} 个 (跳过 ${skipped} 个已下载记录)\n`);
 
     const concurrency = 3;
     const queue = [...toDownload];
@@ -748,6 +786,10 @@ class AlistClient {
           await this.downloadFile(f.path, savePath);
           completed++;
           successPaths.push(f.path);
+          if (skipExisting) {
+            downloadedRecord.set(`${f.name}|${f.size || ''}`, true);
+            saveDownloadedRecord(saveDir, downloadedRecord);
+          }
         } catch (e) {
           log(`   ✗ ${f.name}: ${e.message}`);
         }
@@ -771,7 +813,7 @@ class AlistClient {
   }
 }
 
-async function alistMode() {
+async function alistMode(forceDownload = false) {
   const config = loadConfig();
   const alistUrl = config.alistUrl;
   if (!alistUrl) {
@@ -788,8 +830,9 @@ async function alistMode() {
   log(`路径: ${alistPath}`);
   log(`保存到: ${saveDir}\n`);
 
-  const client = new AlistClient(alistUrl);
-  await client.downloadDir(alistPath, saveDir, true, config.deleteAfterDownload);
+  const skipExisting = !forceDownload;
+  const client = new AlistClient(alistUrl, config.alistToken, config.alistRefresh);
+  await client.downloadDir(alistPath, saveDir, skipExisting, config.deleteAfterDownload);
 }
 
 function normalizeShareUrls(config) {
@@ -884,14 +927,15 @@ async function runAlist(config) {
   const alistPath = config.alistPath || '/kuake/来自：分享';
   const saveDir = path.resolve(config.downloadDir || '.');
   if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
-  const client = new AlistClient(alistUrl);
+  const client = new AlistClient(alistUrl, config.alistToken, config.alistRefresh);
   await client.downloadDir(alistPath, saveDir, true, config.deleteAfterDownload);
   log(`   AList下载完成`);
 }
 
 const mode = process.argv[2];
+const forceDownload = process.argv.includes('--force-download') || process.argv.includes('--no-skip');
 if (mode === '--download' || mode === 'download') {
-  downloadMode().catch(err => {
+  downloadMode(forceDownload).catch(err => {
     logError('\n程序异常: ' + err.message);
     process.exit(1);
   });
@@ -901,7 +945,7 @@ if (mode === '--download' || mode === 'download') {
     process.exit(1);
   });
 } else if (mode === '--alist' || mode === 'alist') {
-  alistMode().catch(err => {
+  alistMode(forceDownload).catch(err => {
     logError('\n程序异常: ' + err.message);
     process.exit(1);
   });
