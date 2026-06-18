@@ -10,6 +10,7 @@
   "targetDirName": "来自：分享",
   "downloadDir": "./downloads",
   "deleteAfterDownload": false,
+  "cleanupAfterDays": 14,
   "alistUrl": "http://127.0.0.1:19336",
   "alistToken": "",
   "alistPath": "/kuake/来自：分享",

@@ -41,6 +41,7 @@ cp config.example.json config.json
 | `targetDirFid` | string | 否 | 转存目标文件夹 ID（优先级高于 targetDirName） |
 | `downloadDir` | string | 否 | 本地下载目录路径 |
 | `deleteAfterDownload` | bool | 否 | 下载后是否删除云盘文件 |
+| `cleanupAfterDays` | int | 否 | 定时任务触发时，自动删除 N 天前同步的文件（云端 + 本地下载），设为 0 禁用，默认 14 |
 | `alistUrl` | string | 否 | AList 服务器地址 |
 | `alistPath` | string | 否 | AList 下载路径 |
 | `alistRefresh` | bool | 否 | AList 列出文件时是否绕过缓存（需管理员权限），默认 false |
@@ -145,7 +146,8 @@ Cron 配置示例：
 ```json
 {
   "syncCron": "0 20 * * *",
-  "alistCron": ["5 20 * * *"]
+  "alistCron": ["5 20 * * *"],
+  "cleanupAfterDays": 14
 }
 ```
 
@@ -154,7 +156,8 @@ Cron 配置示例：
 ```json
 {
   "syncCron": ["0 11 * * *", "0 20 * * *"],
-  "alistCron": ["5 11 * * *", "5 20 * * *"]
+  "alistCron": ["5 11 * * *", "5 20 * * *"],
+  "cleanupAfterDays": 14
 }
 ```
 

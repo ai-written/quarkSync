@@ -47,6 +47,32 @@ function saveDownloadedRecord(saveDir, record) {
   fs.writeFileSync(fp, JSON.stringify(Object.fromEntries(record), null, 2), 'utf-8');
 }
 
+function cleanupLocalFiles(saveDir, maxAgeDays) {
+  if (!maxAgeDays || maxAgeDays <= 0) return { deleted: 0, skipped: 0 };
+  if (!fs.existsSync(saveDir)) return { deleted: 0, skipped: 0 };
+
+  const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+  const entries = fs.readdirSync(saveDir);
+  let deleted = 0, skipped = 0;
+
+  for (const name of entries) {
+    const fp = path.join(saveDir, name);
+    try {
+      const stat = fs.statSync(fp);
+      if (stat.isDirectory()) continue;
+      if (name === DOWNLOADED_FILE) continue;
+      if (stat.mtimeMs < cutoff) {
+        fs.unlinkSync(fp);
+        deleted++;
+        log(`   🗑 清理旧文件: ${name}`);
+      } else {
+        skipped++;
+      }
+    } catch {}
+  }
+  return { deleted, skipped };
+}
+
 function loadConfig() {
   const configPath = path.join(__dirname, 'config.json');
   if (!fs.existsSync(configPath)) {
@@ -308,6 +334,36 @@ class QuarkClient {
     };
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
     return success;
+  }
+
+  async cleanupOldFiles(pdirFid, maxAgeDays) {
+    if (!maxAgeDays || maxAgeDays <= 0) return { deleted: 0 };
+    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    const files = await this.listAllUserFiles(pdirFid);
+    const oldFiles = files.filter(f => {
+      let ts = f.created_at || f.updated_at || 0;
+      if (String(ts).length <= 10) ts *= 1000;
+      return ts < cutoff;
+    });
+    if (oldFiles.length === 0) return { deleted: 0 };
+
+    log(`   清理网盘旧文件 (${maxAgeDays}天前): ${oldFiles.length} 个...`);
+    const batchSize = 30;
+    let deleted = 0;
+    for (let i = 0; i < oldFiles.length; i += batchSize) {
+      const batch = oldFiles.slice(i, i + batchSize);
+      try {
+        await this.deleteFiles(batch.map(f => f.fid));
+        deleted += batch.length;
+        for (const f of batch) {
+          log(`   🗑 已删除: ${f.file_name}`);
+        }
+      } catch (e) {
+        log(`   ✗ 删除批次失败: ${e.message}`);
+      }
+    }
+    log(`   ✓ 网盘清理完成: ${deleted} 个\n`);
+    return { deleted };
   }
 
   async downloadAllFromFolder(pdirFid, saveDir, skipExisting = true, deleteAfter = false) {
@@ -669,6 +725,13 @@ async function syncMode() {
       for (const name of allFailed) log(`  ✗ ${name}`);
     }
   }
+
+  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
+    log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
+    await client.cleanupOldFiles(targetDirFid, config.cleanupAfterDays);
+    const downloadDir = path.resolve(config.downloadDir || '.');
+    cleanupLocalFiles(downloadDir, config.cleanupAfterDays);
+  }
 }
 
 async function downloadMode(forceDownload = false) {
@@ -693,6 +756,11 @@ async function downloadMode(forceDownload = false) {
   log('2. 开始下载...');
   const skipExisting = !forceDownload;
   await client.downloadAllFromFolder(targetDirFid, saveDir, skipExisting, config.deleteAfterDownload);
+
+  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
+    log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
+    cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+  }
 }
 
 class AlistClient {
@@ -881,6 +949,11 @@ async function alistMode(forceDownload = false) {
   const skipExisting = !forceDownload;
   const client = new AlistClient(alistUrl, config.alistToken, config.alistRefresh);
   await client.downloadDir(alistPath, saveDir, skipExisting, config.deleteAfterDownload);
+
+  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
+    log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
+    cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+  }
 }
 
 function normalizeShareUrls(config) {
@@ -999,6 +1072,15 @@ async function runSync(config) {
     log('   失败的文件:');
     for (const name of allFailed) log(`     ✗ ${name}`);
   }
+
+  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
+    log(`\n   执行清理 (${config.cleanupAfterDays}天前的文件)...`);
+    await client.cleanupOldFiles(dirFid, config.cleanupAfterDays);
+    const localResult = cleanupLocalFiles(path.resolve(config.downloadDir || '.'), config.cleanupAfterDays);
+    if (localResult.deleted > 0) {
+      log(`   ✓ 本地清理完成: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
+    }
+  }
 }
 
 async function runAlist(config) {
@@ -1009,6 +1091,14 @@ async function runAlist(config) {
   const client = new AlistClient(alistUrl, config.alistToken, config.alistRefresh);
   await client.downloadDir(alistPath, saveDir, true, config.deleteAfterDownload);
   log(`   AList下载完成`);
+
+  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
+    log(`   执行本地清理 (${config.cleanupAfterDays}天前的文件)...`);
+    const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+    if (localResult.deleted > 0) {
+      log(`   ✓ 本地清理完成: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
+    }
+  }
 }
 
 const mode = process.argv[2];
