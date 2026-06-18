@@ -1,0 +1,21 @@
+{
+  "cookie": "从浏览器复制的完整 Cookie 字符串",
+  "shareUrl": "https://pan.quark.cn/s/xxxxxx",
+  "shareUrls": [
+    "https://pan.quark.cn/s/xxxxxx",
+    { "url": "https://pan.quark.cn/s/yyyyyy", "password": "1234", "tip": "前缀" }
+  ],
+  "password": "提取码",
+  "targetDirFid": "0",
+  "targetDirName": "来自：分享",
+  "downloadDir": "./downloads",
+  "deleteAfterDownload": false,
+  "alistUrl": "http://127.0.0.1:19336",
+  "alistPath": "/kuake/来自：分享",
+  "syncCron": "0 */6 * * *",
+  "alistCron": "0 3 * * *",
+  "tip": "",
+  "hours": 24,
+  "pageSize": 50,
+  "pollInterval": 1000
+}

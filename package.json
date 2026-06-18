@@ -1,0 +1,19 @@
+{
+  "name": "quark-sync",
+  "version": "1.0.0",
+  "description": "自动从夸克网盘分享链接中提取最近两天更新的文件并转存到自己的网盘",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "sync": "node index.js",
+    "download": "node index.js download",
+    "alist": "node index.js alist",
+    "schedule": "node index.js schedule"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "node-cron": "^4.2.1"
+  }
+}
