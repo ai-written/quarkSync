@@ -19,6 +19,7 @@
   "alistCron": "0 3 * * *",
   "tip": "",
   "hours": 24,
+  "minFileSizeMB": 0,
   "pageSize": 50,
   "pollInterval": 1000
 }

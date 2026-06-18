@@ -647,16 +647,23 @@ async function syncMode() {
     log(`   其中文件: ${filesOnly.length} 个`);
 
     const recentFiles = filterByHours(allFiles, shareHours);
+    const minSizeMB = config.minFileSizeMB || 0;
+    const largeFiles = minSizeMB > 0
+      ? recentFiles.filter(f => (f.size || 0) >= minSizeMB * 1048576)
+      : recentFiles;
+    if (minSizeMB > 0) {
+      log(`   过滤 <${minSizeMB}MB 文件: 剩余 ${largeFiles.length} 个\n`);
+    }
     log(`   最近 ${shareHours} 小时更新的文件: ${recentFiles.length} 个\n`);
 
-    if (recentFiles.length === 0) {
+    if (largeFiles.length === 0) {
       log('没有找到符合条件的文件，无需转存。');
       continue;
     }
 
     log('   检查目标文件夹中已存在的文件...');
     const existingMap = await client.getExistingFileMap(targetDirFid);
-    const newFiles = recentFiles.filter(f => {
+    const newFiles = largeFiles.filter(f => {
       const key = `${f.file_name}|${f.size || ''}`;
       if (existingMap.has(key)) return false;
       if (shareTip) {
@@ -1074,9 +1081,14 @@ async function runSync(config) {
       const allFiles = await client.listAllShareFiles(pwdId, stoken);
       const recentFiles = filterByHours(allFiles, shareHours);
 
-      if (recentFiles.length === 0) continue;
+      const minSizeMB = config.minFileSizeMB || 0;
+      const largeFiles = minSizeMB > 0
+        ? recentFiles.filter(f => (f.size || 0) >= minSizeMB * 1048576)
+        : recentFiles;
+
+      if (largeFiles.length === 0) continue;
       const existingMap = await client.getExistingFileMap(dirFid);
-      const newFiles = recentFiles.filter(f => {
+      const newFiles = largeFiles.filter(f => {
         const key = `${f.file_name}|${f.size || ''}`;
         if (existingMap.has(key)) return false;
         if (shareTip) {
