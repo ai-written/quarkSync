@@ -15,7 +15,8 @@ function now() {
 
 function writeLog(level, message) {
   const line = `[${now()}] [${level}] ${message}\n`;
-  fs.appendFileSync(LOG_FILE, line, 'utf-8');
+  const old = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf-8') : '';
+  fs.writeFileSync(LOG_FILE, line + old, 'utf-8');
 }
 
 function log(message) {
@@ -330,6 +331,7 @@ class QuarkClient {
     const batchSize = 10;
     let downloaded = 0;
     const downloadedFids = [];
+    const downloadedNames = [];
     for (let i = 0; i < toDownload.length; i += batchSize) {
       const batch = toDownload.slice(i, i + batchSize);
       const fids = batch.map(f => f.fid);
@@ -344,6 +346,7 @@ class QuarkClient {
       const success = await this.downloadFilesParallel(urls, saveDir, 3);
       downloaded += success.length;
       downloadedFids.push(...success.map(s => s.fid));
+      downloadedNames.push(...success.map(s => s.file_name));
       if (skipExisting) {
         for (const s of success) {
           downloadedRecord.set(`${s.file_name}|${s.size || ''}`, true);
@@ -352,6 +355,10 @@ class QuarkClient {
       }
     }
     log(`\n   下载完成: ${downloaded}/${toDownload.length} 个`);
+    if (downloadedNames.length > 0) {
+      log('   已下载的文件列表:');
+      for (const name of downloadedNames) log(`     ✓ ${name}`);
+    }
 
     if (deleteAfter && downloadedFids.length > 0) {
       log(`   从网盘中删除已下载的 ${downloadedFids.length} 个文件...`);
@@ -514,6 +521,8 @@ async function syncMode() {
 
   let totalSuccess = 0;
   let totalFailed = 0;
+  const allSuccess = [];
+  const allFailed = [];
 
   for (let si = 0; si < shareUrls.length; si++) {
     const { url, password, tip } = shareUrls[si];
@@ -553,7 +562,12 @@ async function syncMode() {
     const existingMap = await client.getExistingFileMap(targetDirFid);
     const newFiles = recentFiles.filter(f => {
       const key = `${f.file_name}|${f.size || ''}`;
-      return !existingMap.has(key);
+      if (existingMap.has(key)) return false;
+      if (shareTip) {
+        const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
+        if (existingMap.has(`${prefix}${f.file_name}|${f.size || ''}`)) return false;
+      }
+      return true;
     });
     const skipped = recentFiles.length - newFiles.length;
     if (skipped > 0) {
@@ -590,29 +604,47 @@ async function syncMode() {
       for (const name of results.success) log(`  ✓ ${name}`);
     }
 
+    let renamedNames = results.success;
     if (shareTip && results.success.length > 0) {
-      log('\n   添加文件名前缀...');
+      renamedNames = [];
+      log('\n   等待文件处理完成...');
+      await new Promise(r => setTimeout(r, 2000));
+
+      log('   添加文件名前缀...');
       const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
-      const existingFiles = await client.listAllUserFiles(targetDirFid);
-      const existingNames = new Set(existingFiles.map(f => f.file_name));
+
+      let existingFiles = await client.listAllUserFiles(targetDirFid);
+      let existingNames = new Set(existingFiles.map(f => f.file_name));
       let renamed = 0;
+
       for (const name of results.success) {
         const newName = `${prefix}${name}`;
         if (existingNames.has(newName)) {
           log(`   ⏭ ${name} (${newName} 已存在)`);
+          renamedNames.push(newName);
           continue;
         }
-        const match = existingFiles.find(f => f.file_name === name);
+        let match = existingFiles.find(f => f.file_name === name);
         if (!match) {
-          log(`   ✗ ${name} 未找到，可能尚未完成处理`);
+          log(`   重试查找 ${name}...`);
+          await new Promise(r => setTimeout(r, 1000));
+          existingFiles = await client.listAllUserFiles(targetDirFid);
+          existingNames = new Set(existingFiles.map(f => f.file_name));
+          match = existingFiles.find(f => f.file_name === name);
+        }
+        if (!match) {
+          log(`   ✗ ${name} 仍未找到，跳过重命名`);
+          renamedNames.push(name);
           continue;
         }
         try {
           await client.renameFile(match.fid, newName);
           renamed++;
           log(`   ✓ ${name} → ${newName}`);
+          renamedNames.push(newName);
         } catch (e) {
           log(`   ✗ ${name} 重命名失败: ${e.message}`);
+          renamedNames.push(name);
         }
       }
       if (renamed > 0) log(`   已重命名 ${renamed} 个文件\n`);
@@ -620,12 +652,22 @@ async function syncMode() {
 
     totalSuccess += results.success.length;
     totalFailed += results.failed.length;
+    allSuccess.push(...renamedNames);
+    allFailed.push(...results.failed);
   }
 
   if (shareUrls.length > 1) {
     log(`\n${'═'.repeat(50)}`);
     log('=== 全部转存结果汇总 ===');
     log(`共处理 ${shareUrls.length} 个分享，成功: ${totalSuccess} 个，失败: ${totalFailed} 个`);
+    if (allSuccess.length > 0) {
+      log('\n成功转存的文件列表:');
+      for (const name of allSuccess) log(`  ✓ ${name}`);
+    }
+    if (allFailed.length > 0) {
+      log('\n失败的文件列表:');
+      for (const name of allFailed) log(`  ✗ ${name}`);
+    }
   }
 }
 
@@ -778,6 +820,7 @@ class AlistClient {
     const queue = [...toDownload];
     let completed = 0;
     const successPaths = [];
+    const successNames = [];
     const worker = async () => {
       while (queue.length > 0) {
         const f = queue.shift();
@@ -786,6 +829,7 @@ class AlistClient {
           await this.downloadFile(f.path, savePath);
           completed++;
           successPaths.push(f.path);
+          successNames.push(f.name);
           if (skipExisting) {
             downloadedRecord.set(`${f.name}|${f.size || ''}`, true);
             saveDownloadedRecord(saveDir, downloadedRecord);
@@ -797,6 +841,10 @@ class AlistClient {
     };
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
     log(`\n   下载完成: ${completed}/${toDownload.length} 个`);
+    if (successNames.length > 0) {
+      log('   已下载的文件列表:');
+      for (const name of successNames) log(`     ✓ ${name}`);
+    }
 
     if (deleteAfter && successPaths.length > 0) {
       log(`   从网盘中删除已下载的 ${successPaths.length} 个文件...`);
@@ -852,11 +900,14 @@ async function scheduleMode() {
   const config = loadConfig();
   const tasks = [];
 
-  if (config.syncCron) {
-    tasks.push({ name: '同步模式', cron: config.syncCron, fn: () => runSync(config) });
+  const syncCrons = [].concat(config.syncCron || []).filter(Boolean);
+  const alistCrons = [].concat(config.alistCron || []).filter(Boolean);
+
+  for (const c of syncCrons) {
+    tasks.push({ name: '同步模式', cron: c, fn: () => runSync(config) });
   }
-  if (config.alistCron) {
-    tasks.push({ name: 'AList下载', cron: config.alistCron, fn: () => runAlist(config) });
+  for (const c of alistCrons) {
+    tasks.push({ name: 'AList下载', cron: c, fn: () => runAlist(config) });
   }
 
   if (tasks.length === 0) {
@@ -892,6 +943,7 @@ async function runSync(config) {
   const pollInterval = config.pollInterval || 1000;
   const shareUrls = normalizeShareUrls(config);
   let totalSuccess = 0, totalFailed = 0;
+  const allSuccess = [], allFailed = [];
   for (const { url, password, tip } of shareUrls) {
     const shareTip = tip || config.tip;
     const pwdId = parseShareUrl(url);
@@ -901,25 +953,52 @@ async function runSync(config) {
     const recentFiles = filterByHours(allFiles, hours);
     if (recentFiles.length === 0) continue;
     const existingMap = await client.getExistingFileMap(dirFid);
-    const newFiles = recentFiles.filter(f => !existingMap.has(`${f.file_name}|${f.size || ''}`));
+    const newFiles = recentFiles.filter(f => {
+      const key = `${f.file_name}|${f.size || ''}`;
+      if (existingMap.has(key)) return false;
+      if (shareTip) {
+        const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
+        if (existingMap.has(`${prefix}${f.file_name}|${f.size || ''}`)) return false;
+      }
+      return true;
+    });
     if (newFiles.length === 0) continue;
     const results = await client.saveFilesInBatches(pwdId, stoken, newFiles, dirFid, pollInterval);
+    let renamedNames = results.success;
     if (shareTip && results.success.length > 0) {
+      renamedNames = [];
+      await new Promise(r => setTimeout(r, 2000));
       const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
-      const existingFiles = await client.listAllUserFiles(dirFid);
-      const existingNames = new Set(existingFiles.map(f => f.file_name));
+      let existingFiles = await client.listAllUserFiles(dirFid);
+      let existingNames = new Set(existingFiles.map(f => f.file_name));
       for (const name of results.success) {
         const newName = `${prefix}${name}`;
-        if (existingNames.has(newName)) continue;
-        const match = existingFiles.find(f => f.file_name === name);
-        if (!match) continue;
-        try { await client.renameFile(match.fid, newName); } catch {}
+        if (existingNames.has(newName)) { renamedNames.push(newName); continue; }
+        let match = existingFiles.find(f => f.file_name === name);
+        if (!match) {
+          await new Promise(r => setTimeout(r, 1000));
+          existingFiles = await client.listAllUserFiles(dirFid);
+          existingNames = new Set(existingFiles.map(f => f.file_name));
+          match = existingFiles.find(f => f.file_name === name);
+        }
+        if (!match) { renamedNames.push(name); continue; }
+        try { await client.renameFile(match.fid, newName); renamedNames.push(newName); } catch { renamedNames.push(name); }
       }
     }
     totalSuccess += results.success.length;
     totalFailed += results.failed.length;
+    allSuccess.push(...renamedNames);
+    allFailed.push(...results.failed);
   }
   log(`   同步完成: 成功 ${totalSuccess} 失败 ${totalFailed}`);
+  if (allSuccess.length > 0) {
+    log('   成功转存的文件:');
+    for (const name of allSuccess) log(`     ✓ ${name}`);
+  }
+  if (allFailed.length > 0) {
+    log('   失败的文件:');
+    for (const name of allFailed) log(`     ✗ ${name}`);
+  }
 }
 
 async function runAlist(config) {

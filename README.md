@@ -45,8 +45,8 @@ cp config.example.json config.json
 | `alistPath` | string | 否 | AList 下载路径 |
 | `alistRefresh` | bool | 否 | AList 列出文件时是否绕过缓存（需管理员权限），默认 false |
 | `alistToken` | string | 否 | AList 认证 Token |
-| `syncCron` | string | 否 | 同步任务的 cron 表达式 |
-| `alistCron` | string | 否 | AList 下载任务的 cron 表达式 |
+| `syncCron` | string/array | 否 | 同步任务的 cron 表达式，支持数组 |
+| `alistCron` | string/array | 否 | AList 下载任务的 cron 表达式，支持数组 |
 | `pageSize` | int | 否 | API 分页大小 |
 | `pollInterval` | int | 否 | 任务轮询间隔（毫秒） |
 
@@ -145,11 +145,20 @@ Cron 配置示例：
 ```json
 {
   "syncCron": "0 20 * * *",
-  "alistCron": "5 20 * * *"
+  "alistCron": ["5 20 * * *"]
 }
 ```
 
-以上配置表示每天 20:00 执行同步，20:05 执行 AList 下载。
+`syncCron` 和 `alistCron` 支持**字符串或数组**：
+
+```json
+{
+  "syncCron": ["0 11 * * *", "0 20 * * *"],
+  "alistCron": ["5 11 * * *", "5 20 * * *"]
+}
+```
+
+以上配置表示每天 11:00 和 20:00 执行同步，11:05 和 20:05 执行 AList 下载。
 
 ## 工作流程
 

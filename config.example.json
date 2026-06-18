@@ -14,7 +14,7 @@
   "alistToken": "",
   "alistPath": "/kuake/来自：分享",
   "alistRefresh": false,
-  "syncCron": "0 */6 * * *",
+  "syncCron": ["0 11", "0 20"],
   "alistCron": "0 3 * * *",
   "tip": "",
   "hours": 24,
