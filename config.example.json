@@ -3,7 +3,7 @@
   "shareUrl": "https://pan.quark.cn/s/xxxxxx",
   "shareUrls": [
     "https://pan.quark.cn/s/xxxxxx",
-    { "url": "https://pan.quark.cn/s/yyyyyy", "password": "1234", "tip": "前缀" }
+    { "url": "https://pan.quark.cn/s/yyyyyy", "password": "1234", "tip": "前缀", "hours": 48 }
   ],
   "password": "提取码",
   "targetDirFid": "0",

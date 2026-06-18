@@ -619,8 +619,9 @@ async function syncMode() {
   const allFailed = [];
 
   for (let si = 0; si < shareUrls.length; si++) {
-    const { url, password, tip } = shareUrls[si];
+    const { url, password, tip, hours: itemHours } = shareUrls[si];
     const shareTip = tip || config.tip;
+    const shareHours = itemHours || hours;
     const pwdId = parseShareUrl(url);
     const passcode = password || config.password || '';
 
@@ -631,7 +632,7 @@ async function syncMode() {
     } else {
       log(`分享 ID: ${pwdId}`);
     }
-    log(`时间范围: 最近 ${hours} 小时更新\n`);
+    log(`时间范围: 最近 ${shareHours} 小时更新\n`);
 
     try {
     log(`2. 获取分享 token (${pwdId})...`);
@@ -645,8 +646,8 @@ async function syncMode() {
     const filesOnly = allFiles.filter(f => !f.dir);
     log(`   其中文件: ${filesOnly.length} 个`);
 
-    const recentFiles = filterByHours(allFiles, hours);
-    log(`   最近 ${hours} 小时更新的文件: ${recentFiles.length} 个\n`);
+    const recentFiles = filterByHours(allFiles, shareHours);
+    log(`   最近 ${shareHours} 小时更新的文件: ${recentFiles.length} 个\n`);
 
     if (recentFiles.length === 0) {
       log('没有找到符合条件的文件，无需转存。');
@@ -1063,14 +1064,16 @@ async function runSync(config) {
   const shareUrls = normalizeShareUrls(config);
   let totalSuccess = 0, totalFailed = 0;
   const allSuccess = [], allFailed = [];
-  for (const { url, password, tip } of shareUrls) {
+  for (const { url, password, tip, hours: itemHours } of shareUrls) {
     const shareTip = tip || config.tip;
+    const shareHours = itemHours || hours;
     const pwdId = parseShareUrl(url);
     const passcode = password || config.password || '';
     try {
       const stoken = await client.getShareToken(pwdId, passcode);
       const allFiles = await client.listAllShareFiles(pwdId, stoken);
-      const recentFiles = filterByHours(allFiles, hours);
+      const recentFiles = filterByHours(allFiles, shareHours);
+
       if (recentFiles.length === 0) continue;
       const existingMap = await client.getExistingFileMap(dirFid);
       const newFiles = recentFiles.filter(f => {
