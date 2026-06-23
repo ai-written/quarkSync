@@ -162,6 +162,41 @@ async function tryShareUrls(client, pwdIds, passcode, tip) {
   return null;
 }
 
+function parseEpisode(fileName) {
+  const name = fileName.replace(/\.[^.]+$/, '');
+  let m;
+
+  m = name.match(/[Ss](\d+)\s*[Ee](?:\s*P\s*)?(\d+)/);
+  if (m) return { season: +m[1], episode: +m[2] };
+
+  m = name.match(/第?\s*(\d+)\s*季.*?第?\s*(\d+)\s*集/);
+  if (m) return { season: +m[1], episode: +m[2] };
+
+  m = name.match(/第?\s*(\d+)\s*集/);
+  if (m) return { season: 0, episode: +m[1] };
+
+  const nums = [...name.matchAll(/(\d+)/g)].map(n => +n[1]);
+  const nonYear = nums.filter(n => n < 1900 || n > 2099);
+  if (nonYear.length > 0) {
+    const best = nonYear.reduce((a, b) => String(a).length >= String(b).length ? a : b);
+    return { season: 0, episode: best };
+  }
+
+  return null;
+}
+
+function sortByEpisode(a, b) {
+  const pa = parseEpisode(a.file_name);
+  const pb = parseEpisode(b.file_name);
+  if (pa && pb) {
+    if (pa.season !== pb.season) return pb.season - pa.season;
+    return pb.episode - pa.episode;
+  }
+  if (pa) return -1;
+  if (pb) return 1;
+  return (b.updated_at || 0) - (a.updated_at || 0);
+}
+
 function dt() {
   return Math.floor(Math.random() * 9000) + 100;
 }
@@ -693,7 +728,7 @@ async function syncMode() {
     const maxPerShare = config.maxFilesPerShare || 0;
     let capped = false;
     if (maxPerShare > 0 && largeFiles.length > maxPerShare) {
-      largeFiles = [...largeFiles].sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0)).slice(0, maxPerShare);
+      largeFiles = [...largeFiles].sort(sortByEpisode).slice(0, maxPerShare);
       capped = true;
     }
     log(`   最近 ${shareHours} 小时更新的文件: ${recentFiles.length} 个` +
@@ -1132,7 +1167,7 @@ async function runSync(config) {
 
       const maxPerShare = config.maxFilesPerShare || 0;
       if (maxPerShare > 0 && largeFiles.length > maxPerShare) {
-        largeFiles = [...largeFiles].sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0)).slice(0, maxPerShare);
+        largeFiles = [...largeFiles].sort(sortByEpisode).slice(0, maxPerShare);
       }
 
       if (largeFiles.length === 0) continue;
