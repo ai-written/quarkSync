@@ -35,7 +35,7 @@ cp config.example.json config.json
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `cookie` | string | 是 | 夸克网盘登录后的完整 Cookie 字符串 |
-| `shareUrls` | array | 是 | 分享链接列表，每项包含 `url`（链接）、`password`（提取码，可选）、`tip`（文件名前缀，可选）、`hours`（时间窗口覆盖全局，可选） |
+| `shareUrls` | array | 是 | 分享链接列表，每项包含 `url`（链接，可为字符串或数组作为备用链接，按序 failover）、`password`（提取码，可选）、`tip`（文件名前缀，可选）、`hours`（时间窗口覆盖全局，可选） |
 | `shareUrl` | string | 否 | 单个分享链接（与 `shareUrls` 二选一） |
 | `password` | string | 否 | 默认提取码 |
 | `tip` | string | 否 | 默认文件名前缀 |
@@ -82,6 +82,10 @@ cp config.example.json config.json
     {
       "url": "https://pan.quark.cn/s/yyyyyyyy",
       "tip": "斗破苍穹-"
+    },
+    {
+      "url": ["https://pan.quark.cn/s/main1", "https://pan.quark.cn/s/backup1"],
+      "tip": "备用链接示例"
     }
   ]
 }

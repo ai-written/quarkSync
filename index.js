@@ -71,6 +71,8 @@ function cleanupLocalFiles(saveDir, maxAgeDays) {
   const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
   const entries = fs.readdirSync(saveDir);
   let deleted = 0, skipped = 0;
+  const downloadedRecord = loadDownloadedRecord(saveDir);
+  let recordChanged = false;
 
   for (const name of entries) {
     const fp = path.join(saveDir, name);
@@ -82,10 +84,20 @@ function cleanupLocalFiles(saveDir, maxAgeDays) {
         fs.unlinkSync(fp);
         deleted++;
         log(`   🗑 清理旧文件: ${name}`);
+        for (const [key] of downloadedRecord) {
+          if (key.startsWith(`${name}|`)) {
+            downloadedRecord.delete(key);
+            recordChanged = true;
+          }
+        }
       } else {
         skipped++;
       }
     } catch {}
+  }
+
+  if (recordChanged) {
+    saveDownloadedRecord(saveDir, downloadedRecord);
   }
   return { deleted, skipped };
 }
@@ -130,6 +142,24 @@ function parseShareUrl(url) {
   const match = url.match(/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)/);
   if (!match) throw new Error('无法解析分享链接');
   return match[1].split('#')[0].split('?')[0];
+}
+
+async function tryShareUrls(client, pwdIds, passcode, tip) {
+  for (let i = 0; i < pwdIds.length; i++) {
+    const pwdId = pwdIds[i];
+    try {
+      const stoken = await client.getShareToken(pwdId, passcode);
+      const allFiles = await client.listAllShareFiles(pwdId, stoken);
+      if (pwdIds.length > 1 && i > 0) {
+        log(`   ✓ 备用链接 ${pwdId} 可用`);
+      }
+      return { stoken, allFiles, pwdId };
+    } catch (e) {
+      const label = tip ? ` (${tip})` : '';
+      logError(`   ✗ 分享链接 ${pwdId}${label} 失败: ${e.message}`);
+    }
+  }
+  return null;
 }
 
 function dt() {
@@ -622,25 +652,30 @@ async function syncMode() {
     const { url, password, tip, hours: itemHours } = shareUrls[si];
     const shareTip = tip || config.tip;
     const shareHours = itemHours || hours;
-    const pwdId = parseShareUrl(url);
+    const pwdIds = (Array.isArray(url) ? url : [url]).map(u => parseShareUrl(u));
     const passcode = password || config.password || '';
 
     if (shareUrls.length > 1) {
       log(`\n${'═'.repeat(50)}`);
       log(`处理第 ${si + 1}/${shareUrls.length} 个分享`);
-      log(`分享 ID: ${pwdId}`);
+      log(`分享 ID: ${pwdIds.join(', ')}`);
     } else {
-      log(`分享 ID: ${pwdId}`);
+      log(`分享 ID: ${pwdIds.join(', ')}`);
     }
     log(`时间范围: 最近 ${shareHours} 小时更新\n`);
 
     try {
-    log(`2. 获取分享 token (${pwdId})...`);
-    const stoken = await client.getShareToken(pwdId, passcode);
+    log('2. 获取分享 token...');
+    const best = await tryShareUrls(client, pwdIds, passcode, shareTip);
+    if (!best) {
+      logError(`   ✗ 处理分享失败 ${shareTip ? `(${shareTip}) ` : ''}- 所有链接均已失效`);
+      totalFailed++;
+      continue;
+    }
+    const { stoken, allFiles, pwdId } = best;
     log('   ✓ 获取成功\n');
 
     log('3. 列出分享文件 (递归获取所有子文件夹)...');
-    const allFiles = await client.listAllShareFiles(pwdId, stoken);
     log(`   ✓ 共找到 ${allFiles.length} 个项目 (含文件夹)\n`);
 
     const filesOnly = allFiles.filter(f => !f.dir);
@@ -1082,11 +1117,12 @@ async function runSync(config) {
   for (const { url, password, tip, hours: itemHours } of shareUrls) {
     const shareTip = tip || config.tip;
     const shareHours = itemHours || hours;
-    const pwdId = parseShareUrl(url);
+    const pwdIds = (Array.isArray(url) ? url : [url]).map(u => parseShareUrl(u));
     const passcode = password || config.password || '';
     try {
-      const stoken = await client.getShareToken(pwdId, passcode);
-      const allFiles = await client.listAllShareFiles(pwdId, stoken);
+      const best = await tryShareUrls(client, pwdIds, passcode, shareTip);
+      if (!best) continue;
+      const { stoken, allFiles, pwdId } = best;
       const recentFiles = filterByHours(allFiles, shareHours);
 
       const minSizeMB = config.minFileSizeMB || 0;
