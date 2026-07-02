@@ -84,8 +84,9 @@ function cleanupLocalFiles(saveDir, maxAgeDays) {
         fs.unlinkSync(fp);
         deleted++;
         log(`   🗑 清理旧文件: ${name}`);
+        const epKey = getEpisodeKey(name);
         for (const [key] of downloadedRecord) {
-          if (key.startsWith(`${name}|`)) {
+          if (key.startsWith(`${name}|`) || (epKey && key === epKey)) {
             downloadedRecord.delete(key);
             recordChanged = true;
           }
@@ -195,6 +196,75 @@ function sortByEpisode(a, b) {
   if (pa) return -1;
   if (pb) return 1;
   return (b.updated_at || 0) - (a.updated_at || 0);
+}
+
+function getEpisodeKey(fileName) {
+  const ep = parseEpisode(fileName);
+  if (!ep) return null;
+  const name = fileName.replace(/\.[^.]+$/, '');
+  let show = name;
+  show = show.replace(/[-_\s]*[Ss]\d+[-\s]*[Ee]\d+.*$/, '');
+  show = show.replace(/[-_\s]*第?\s*\d+\s*季.*$/, '');
+  show = show.replace(/[-_\s]*第?\s*\d+\s*集.*$/, '');
+  show = show.replace(/(4k|2160p|1080p|720p|高清|标清|hd|fhd|uhd|sd)/gi, '');
+  show = show.replace(/[-_\s]*\d+\s*$/, '');
+  show = show.replace(/[-_\s]+$/, '').trim();
+  return `ep_${show}_S${ep.season}_E${ep.episode}`;
+}
+
+const QUALITY_SCORE = { '4k': 5, '2160p': 4, 'uhd': 4, '1080p': 3, 'fhd': 3, '1080': 3, '720p': 2, 'hd': 2, '720': 2, '高清': 2, '标清': 1, 'sd': 1 };
+
+function getQualityScore(fileName) {
+  const lower = fileName.toLowerCase();
+  for (const [kw, score] of Object.entries(QUALITY_SCORE)) {
+    if (lower.includes(kw)) return score;
+  }
+  return 0;
+}
+
+function isHigherQuality(aName, aSize, bName, bSize) {
+  const qA = getQualityScore(aName);
+  const qB = getQualityScore(bName);
+  if (qA !== qB) return qA > qB;
+  return (aSize || 0) > (bSize || 0);
+}
+
+function deduplicateByEpisode(files) {
+  const groups = new Map();
+  const unkeyed = [];
+  for (const f of files) {
+    const name = f.file_name || f.name;
+    const key = getEpisodeKey(name);
+    if (key) {
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(f);
+    } else {
+      unkeyed.push(f);
+    }
+  }
+  const deduped = [];
+  let removed = 0;
+  for (const [key, group] of groups) {
+    group.sort((a, b) => {
+      const aName = a.file_name || a.name;
+      const bName = b.file_name || b.name;
+      return isHigherQuality(bName, b.size || 0, aName, a.size || 0) ? 1 : -1;
+    });
+    deduped.push(group[0]);
+    if (group.length > 1) {
+      removed += group.length - 1;
+      log(`   ⏭ 同名集去重: ${key} (${group.length}个版本, 保留 ${group[0].file_name || group[0].name})`);
+    }
+  }
+  if (removed > 0) log(`   → 去重移除 ${removed} 个较低画质版本\n`);
+  deduped.push(...unkeyed);
+  return deduped;
+}
+
+function getDedupKey(fileItem) {
+  const name = fileItem.file_name || fileItem.name;
+  const epKey = getEpisodeKey(name);
+  return epKey || `${name}|${fileItem.size || ''}`;
 }
 
 function dt() {
@@ -471,12 +541,18 @@ class QuarkClient {
 
   async downloadAllFromFolder(pdirFid, saveDir, skipExisting = true, deleteAfter = false) {
     log(`   列出目标文件夹中的文件...`);
-    const files = await this.listAllUserFiles(pdirFid);
-    log(`   ✓ 共 ${files.length} 个文件\n`);
+    let files = await this.listAllUserFiles(pdirFid);
+    const rawCount = files.length;
+    files = deduplicateByEpisode(files);
+    if (files.length < rawCount) {
+      log(`   ✓ 共 ${rawCount} 个文件 (去重后 ${files.length} 个)\n`);
+    } else {
+      log(`   ✓ 共 ${files.length} 个文件\n`);
+    }
 
     const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
     const toDownload = skipExisting
-      ? files.filter(f => !downloadedRecord.has(`${f.file_name}|${f.size || ''}`))
+      ? files.filter(f => !downloadedRecord.has(getDedupKey(f)))
       : files;
 
     if (toDownload.length === 0) {
@@ -508,7 +584,7 @@ class QuarkClient {
       downloadedNames.push(...success.map(s => s.file_name));
       if (skipExisting) {
         for (const s of success) {
-          downloadedRecord.set(`${s.file_name}|${s.size || ''}`, true);
+          downloadedRecord.set(getDedupKey(s), true);
         }
         saveDownloadedRecord(saveDir, downloadedRecord);
       }
@@ -999,12 +1075,18 @@ class AlistClient {
 
   async downloadDir(alistPath, saveDir, skipExisting = true, deleteAfter = false) {
     log(`   列出文件夹: ${alistPath} ...`);
-    const files = await this.listAllFiles(alistPath);
-    log(`   ✓ 共 ${files.length} 个文件\n`);
+    let files = await this.listAllFiles(alistPath);
+    const rawCount = files.length;
+    files = deduplicateByEpisode(files);
+    if (files.length < rawCount) {
+      log(`   ✓ 共 ${rawCount} 个文件 (去重后 ${files.length} 个)\n`);
+    } else {
+      log(`   ✓ 共 ${files.length} 个文件\n`);
+    }
 
     const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
     const toDownload = skipExisting
-      ? files.filter(f => !downloadedRecord.has(`${f.name}|${f.size || ''}`))
+      ? files.filter(f => !downloadedRecord.has(getDedupKey(f)))
       : files;
 
     if (toDownload.length === 0) {
@@ -1030,7 +1112,7 @@ class AlistClient {
           successPaths.push(f.path);
           successNames.push(f.name);
           if (skipExisting) {
-            downloadedRecord.set(`${f.name}|${f.size || ''}`, true);
+            downloadedRecord.set(getDedupKey(f), true);
             saveDownloadedRecord(saveDir, downloadedRecord);
           }
         } catch (e) {
