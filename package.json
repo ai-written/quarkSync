@@ -11,7 +11,8 @@
     "download-force": "node index.js download --force-download",
     "alist": "node index.js alist",
     "alist-force": "node index.js alist --force-download",
-    "schedule": "node index.js schedule"
+    "schedule": "node index.js schedule",
+    "docker:build": "docker buildx build --platform linux/amd64,linux/arm64 -t hsiangleev/quark-sync:latest --push ."
   },
   "license": "MIT",
   "dependencies": {

@@ -1,0 +1,11 @@
+node_modules
+sync.log
+.downloaded.json
+.download.lock
+.alist.lock
+downloads
+logs
+config
+.git
+.gitignore
+*.md

@@ -1,0 +1,9 @@
+services:
+  quark-sync:
+    image: hsiangleev/quark-sync:latest
+    container_name: quark-sync
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+      - ./downloads:/app/downloads
+    restart: unless-stopped
