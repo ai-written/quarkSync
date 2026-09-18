@@ -56,11 +56,24 @@
   .subcard .grid { grid-template-columns: 150px 1fr; }
 
   /* 分享链接表格 */
-  .tablewrap { overflow-x: auto; border: 1px solid #e6e9ec; border-radius: 6px; background: #fff; }
+  .tablewrap { overflow: auto; border: 1px solid #e6e9ec; border-radius: 6px; background: #fff; }
+  /* 分享页：面板本身不滚动，改由表格体内部滚动，表头固定不随内容滚走 */
+  #panel-shares.active { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 0; }
+  #panel-shares > .msg { flex: none; }
+  #panel-shares > .card { flex: 1; min-height: 0; display: flex; flex-direction: column;
+                          margin-bottom: 20px; }
+  #panel-shares > .card > .card-hd { flex: none; }
+  #panel-shares > .card > .card-bd { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  #panel-shares .tablewrap { flex: 1; min-height: 0; }
+  #panel-shares .tablewrap + .actions,
+  #panel-shares .tablewrap + .actions + .hint { flex: none; }
   table.share-table { width: 100%; min-width: 860px; border-collapse: collapse; }
+  /* 表头吸顶。border-collapse: collapse 下 Chrome 滚动时可能丢底边，
+     故用 box-shadow 画分隔线，避免表头与内容之间出现缝隙 */
   table.share-table th { font-size: 12px; color: #57606a; font-weight: 600; text-align: left;
-                         padding: 7px 8px; background: #f6f8fa; border-bottom: 1px solid #d0d7de;
-                         white-space: nowrap; }
+                         padding: 7px 8px; background: #f6f8fa;
+                         box-shadow: inset 0 -1px 0 #d0d7de;
+                         white-space: nowrap; position: sticky; top: 0; z-index: 3; }
   table.share-table td { padding: 6px 8px; border-bottom: 1px solid #eef0f2; vertical-align: middle; }
   table.share-table tr:last-child td { border-bottom: none; }
   /* 表格内所有控件统一高度，避免输入框 27px / 按钮 33px 这类错位 */
