@@ -20,6 +20,7 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UI_FILE = path.join(__dirname, 'ui.html');
+const ICON_FILE = path.join(__dirname, 'quark-sync.ico');
 
 const COOKIE_NAME = 'qsid';
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
@@ -276,6 +277,26 @@ function createServer() {
           'X-Content-Type-Options': 'nosniff',
         });
         res.end(html);
+        return;
+      }
+
+      // ---- 网站图标（浏览器请求 favicon 时不带会话，因此不做鉴权）----
+      if (req.method === 'GET' && (p === '/favicon.ico' || p === '/quark-sync.ico')) {
+        let icon;
+        try {
+          icon = fs.readFileSync(ICON_FILE);
+        } catch {
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('favicon not found');
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': 'image/x-icon',
+          'Content-Length': icon.length,
+          'Cache-Control': 'public, max-age=86400',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        res.end(icon);
         return;
       }
 

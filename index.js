@@ -72,15 +72,41 @@ function tailRawLines(fp, maxBytes = MAX_LOG_SCAN_BYTES, chunkSize = 64 * 1024) 
 }
 
 // 判断日志是否为旧版倒序（最新在前）。
-// 用相邻时间戳的升降配对投票，而不是只看首尾：迁移前若已追加过新行，
-// 首尾启发式会被尾部的新行带偏而漏判。
+// 判据必须保守：误判会把本来正确的顺序文件反转，导致后续清理从错误的一端删除。
+// 因此要求三个条件同时成立：
+//   1) 有足够多的可比对相邻对（同一秒的重复时间戳不参与比较）
+//   2) 递减对明显多于递增对
+//   3) 首条时间戳确实晚于末条时间戳
 function looksReversed(tsList) {
+  if (tsList.length < 2) return false;
   let asc = 0, desc = 0;
   for (let i = 1; i < tsList.length; i++) {
     if (tsList[i] > tsList[i - 1]) asc++;
     else if (tsList[i] < tsList[i - 1]) desc++;
   }
-  return desc > asc;
+  const comparable = asc + desc;
+  // 证据不足（多数时间戳相同）时不反转，宁可漏迁移也不破坏顺序
+  if (comparable < 3) return false;
+  if (desc <= asc * 2) return false;
+  return tsList[0] > tsList[tsList.length - 1];
+}
+
+// 把日志行按「记录」分组：每条带时间戳的行连同其后的续行（无时间戳）算一条记录。
+// 多行消息（message 内含 \n）会写出一行时间戳 + 若干续行，它们必须整体处理，
+// 否则反转顺序或按行删除都会让续行与所属记录错位。
+function groupLogRecords(lines) {
+  const groups = [];
+  let orphan = [];   // 文件开头没有归属的续行（理论上是迁移残留）
+  for (const line of lines) {
+    if (parseLogTime(line) !== null) {
+      groups.push({ ts: parseLogTime(line), lines: [line] });
+    } else if (groups.length > 0) {
+      groups[groups.length - 1].lines.push(line);
+    } else {
+      orphan.push(line);
+    }
+  }
+  return { groups, orphan };
 }
 
 function cleanupOldLogs() {
@@ -94,23 +120,33 @@ function cleanupOldLogs() {
 
   let changed = false;
 
-  // 旧版本为倒序写入（最新在前），此处做一次性顺序迁移
-  const tsList = lines.map(parseLogTime).filter(t => t !== null);
+  // 旧版本为倒序写入（最新在前），此处做一次性顺序迁移。
+  // 迁移在「记录」粒度上进行，避免把续行翻到其所属记录之前。
+  const first = groupLogRecords(lines);
+  const tsList = first.groups.map(g => g.ts);
   if (tsList.length >= 2 && looksReversed(tsList)) {
-    lines.reverse();
+    const rebuilt = [];
+    if (first.orphan.length > 0) rebuilt.push(...first.orphan);
+    for (let i = first.groups.length - 1; i >= 0; i--) rebuilt.push(...first.groups[i].lines);
+    lines = rebuilt;
     changed = true;
   }
 
-  // 顺序写入后，过期记录集中在文件头部，丢弃前缀即可
+  // 重新分组（可能刚迁移过），然后丢弃头部所有过期记录。
+  // 过期记录集中在文件头部，因此从头丢弃即可。
+  const { groups, orphan } = groupLogRecords(lines);
   const cutoff = Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  let drop = 0;
-  while (drop < lines.length) {
-    const t = parseLogTime(lines[drop]);
-    if (t === null || t >= cutoff) break;
-    drop++;
+  let dropGroups = 0;
+  for (const g of groups) {
+    if (g.ts >= cutoff) break;   // 遇到未过期记录：其后的全部保留
+    dropGroups++;
   }
-  if (drop > 0) {
-    lines = lines.slice(drop);
+  if (dropGroups > 0) {
+    // 只保留未过期的记录；开头的孤儿续行一并丢弃（它们没有可保留的归属）
+    const kept = [];
+    for (let i = dropGroups; i < groups.length; i++) kept.push(...groups[i].lines);
+    if (kept.length === 0 && orphan.length > 0) kept.push(...orphan);
+    lines = kept;
     changed = true;
   }
 
@@ -1066,9 +1102,9 @@ async function syncInternal(config) {
     if (shareUrls.length > 1) {
       log(`\n${'═'.repeat(50)}`);
       log(`处理第 ${si + 1}/${shareUrls.length} 个分享`);
-      log(`分享 ID: ${pwdIds.join(', ')}`);
+      log(`分享 ID: ${pwdIds.join(', ')}${shareTip ? `  (前缀: ${shareTip})` : ''}`);
     } else {
-      log(`分享 ID: ${pwdIds.join(', ')}`);
+      log(`分享 ID: ${pwdIds.join(', ')}${shareTip ? `  (前缀: ${shareTip})` : ''}`);
     }
     log(`时间范围: 最近 ${shareHours} 小时更新\n`);
 

@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY index.js web.js ui.html config.example.json docker-entrypoint.sh ./
+COPY index.js web.js ui.html quark-sync.ico config.example.json docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh
 
 RUN mkdir -p /app/config /app/logs /app/downloads

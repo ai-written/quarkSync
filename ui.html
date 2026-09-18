@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/x-icon" href="/quark-sync.ico">
+<link rel="shortcut icon" type="image/x-icon" href="/quark-sync.ico">
 <title>quark-sync 管理面板</title>
 <style>
   * { box-sizing: border-box; }
@@ -23,28 +25,28 @@
                  border-bottom: 2px solid transparent; font-size: 14px; }
   .tabs button.active { color: #1f6feb; border-bottom-color: #1f6feb; font-weight: 600; }
   .panel { display: none; }
-  /* 底部留白由 .savebar / 面板内最后一个元素自己处理，否则保存栏会浮在底部上方 */
+  /* 面板自身滚动；底部留白由面板内容自己处理（保存栏在面板之外） */
   .panel.active { display: block; flex: 1; min-height: 0; overflow-y: auto;
-                  scrollbar-gutter: stable; }
+                  scrollbar-gutter: stable; padding-bottom: 20px; }
   /* 日志面板改为内部滚动（工具栏保持可见），避免内外双滚动条 */
   #panel-logs.active { display: flex; flex-direction: column; overflow: hidden; }
   #panel-logs .card { flex: 1; min-height: 0; display: flex; flex-direction: column; margin-bottom: 20px; }
   #panel-logs .filters { flex: none; }
-  /* 非配置面板的底部留白 */
-  #panel-logs, #panel-tasks { padding-bottom: 20px; }
   .card { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 16px; margin-bottom: 14px; }
   .card h2 { font-size: 14px; margin: 0 0 12px; color: #1f2328; }
   .grid { display: grid; grid-template-columns: 180px 1fr; gap: 10px 14px; align-items: center; }
   .grid label { color: #57606a; }
 
-  /* 可折叠的一级卡片 */
-  .card > .card-hd { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  /* 可折叠的一级卡片：仅带 data-card 的卡片才有可点击的视觉暗示，
+     避免普通卡片标题显示 pointer 光标却点不动 */
+  .card > .card-hd { display: flex; align-items: center; gap: 8px; user-select: none; }
+  .card[data-card] > .card-hd { cursor: pointer; }
   .card > .card-hd h2 { margin: 0; flex: 1; }
   .card > .card-hd .chev { color: #8b949e; font-size: 11px; line-height: 1;
                            transition: transform .15s ease; transform-origin: center; }
   .card.collapsed > .card-hd .chev { transform: rotate(-90deg); }
   .card.collapsed > .card-bd { display: none; }
-  .card > .card-hd:hover h2 { color: #1f6feb; }
+  .card[data-card] > .card-hd:hover h2 { color: #1f6feb; }
 
   /* 二级卡片 */
   .subcard { border: 1px solid #e6e9ec; border-radius: 6px; padding: 14px;
@@ -108,9 +110,9 @@
            align-items: center; justify-content: center; }
   #login .card { width: 100%; max-width: 340px; margin-bottom: 0; }
   .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-  /* 底部保存栏：吸在配置面板底部；panel 不再有 padding-bottom，
-     因此它能紧贴滚动区域下沿（padding 已并入 savebar 自身） */
-  .savebar { position: sticky; bottom: 0; z-index: 2; background: #f5f6f8;
+  /* 常驻底部保存栏：位于 .wrap 内、所有面板之外，
+     因此任何 tab 下都可见；面板自身滚动，保存栏不随内容滚动 */
+  .savebar { flex: none; position: relative; z-index: 2; background: #f5f6f8;
              padding: 12px 0 20px; border-top: 1px solid #e0e3e6; margin: 0; }
 </style>
 </head>
@@ -138,13 +140,49 @@
 
   <div class="wrap">
     <div class="tabs">
-      <button data-tab="config" class="active">配置</button>
+      <button data-tab="shares" class="active">分享链接</button>
+      <button data-tab="config">配置</button>
       <button data-tab="logs">日志</button>
       <button data-tab="tasks">任务</button>
     </div>
 
+    <!-- ============ 分享链接（高频编辑，独立成页）============ -->
+    <div class="panel active" id="panel-shares">
+      <div id="shareMsg" class="msg"></div>
+      <div class="card">
+        <div class="card-hd"><h2>分享链接 <span class="hint" style="font-weight:400">（每项可单独覆盖时间窗口 / 最小体积 / 数量限制）</span></h2></div>
+        <div class="card-bd">
+          <div class="tablewrap">
+            <table class="share-table">
+              <thead>
+                <tr>
+                  <th style="width:44px">#</th>
+                  <th style="width:110px">前缀 tip</th>
+                  <th style="min-width:220px">链接</th>
+                  <th style="width:82px">提取码</th>
+                  <th style="width:88px">时间窗口</th>
+                  <th style="width:82px">最小 MB</th>
+                  <th style="width:82px">最多数量</th>
+                  <th style="width:64px"></th>
+                </tr>
+              </thead>
+              <tbody id="shareBody"></tbody>
+            </table>
+          </div>
+          <div class="actions" style="margin-top:10px">
+            <button id="addShare">+ 添加分享</button>
+            <span class="hint" id="shareCount"></span>
+          </div>
+          <div class="hint" style="margin-top:8px">
+            链接格一行一个链接；写多行即为「备用链接组」，按顺序 failover（前一个失效才试下一个）。<br>
+            覆盖项留空 = 继承全局；填 0 = 显式覆盖（最小体积/数量为不限制）。
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- ============ 配置 ============ -->
-    <div class="panel active" id="panel-config">
+    <div class="panel" id="panel-config">
       <div id="cfgMsg" class="msg"></div>
 
       <!-- ===== 一级：账号与目标 ===== -->
@@ -173,34 +211,6 @@
               <input type="text" id="tip" placeholder="如：遮天-">
               <label>默认提取码</label>
               <input type="text" id="password" placeholder="分享默认提取码">
-            </div>
-          </div>
-
-          <div class="subcard">
-            <h3>分享链接 <span class="hint">（每项可单独覆盖时间窗口 / 最小体积 / 数量限制）</span></h3>
-            <div class="tablewrap">
-              <table class="share-table">
-                <thead>
-                  <tr>
-                    <th style="width:44px">#</th>
-                    <th style="width:110px">前缀 tip</th>
-                    <th style="min-width:220px">链接</th>
-                    <th style="width:82px">提取码</th>
-                    <th style="width:88px">时间窗口</th>
-                    <th style="width:82px">最小 MB</th>
-                    <th style="width:82px">最多数量</th>
-                    <th style="width:64px"></th>
-                  </tr>
-                </thead>
-                <tbody id="shareBody"></tbody>
-              </table>
-            </div>
-            <div class="actions" style="margin-top:10px">
-              <button id="addShare">+ 添加分享</button>
-            </div>
-            <div class="hint" style="margin-top:8px">
-              链接格一行一个链接；写多行即为「备用链接组」，按顺序 failover（前一个失效才试下一个）。<br>
-              覆盖项留空 = 继承全局；填 0 = 显式覆盖（最小体积/数量为不限制）。
             </div>
           </div>
         </div>
@@ -314,12 +324,6 @@
           </div>
         </div>
       </div>
-
-      <div class="actions savebar">
-        <button class="primary" id="saveBtn">保存配置</button>
-        <button id="reloadBtn">放弃修改并重新载入</button>
-        <span class="hint" id="saveHint"></span>
-      </div>
     </div>
 
     <!-- ============ 日志 ============ -->
@@ -361,6 +365,13 @@
         <p class="hint" style="margin:10px 0 0">同一时间只允许一个任务运行，重复触发会被拒绝。</p>
       </div>
     </div>
+
+    <!-- ===== 常驻底部保存栏：任何 tab 下都可保存 ===== -->
+    <div class="actions savebar">
+      <button class="primary" id="saveBtn">保存配置</button>
+      <button id="reloadBtn">放弃修改并重新载入</button>
+      <span class="hint" id="saveHint"></span>
+    </div>
   </div>
 </div>
 
@@ -374,6 +385,14 @@ function showMsg(el, text, ok) {
   e.textContent = text;
   e.className = 'msg ' + (ok ? 'ok' : 'err');
   if (ok) setTimeout(() => { if (e.textContent === text) e.className = 'msg'; }, 4000);
+}
+
+// 保存栏是常驻的，提示要显示在当前可见的面板里（分享页或配置页），
+// 否则用户在分享页点保存会看不到任何反馈
+function notify(text, ok) {
+  const active = document.querySelector('.panel.active');
+  const target = active && active.id === 'panel-shares' ? 'shareMsg' : 'cfgMsg';
+  showMsg(target, text, ok);
 }
 
 async function api(method, url, body) {
@@ -521,10 +540,20 @@ function renderShares(list) {
 }
 
 function renumber() {
+  let total = 0, groups = 0;
   $('shareBody').querySelectorAll('tr.share-row').forEach((tr, i) => {
+    const isGroup = rowIsGroup(tr);
     tr.querySelector('.idx').innerHTML =
-      `#${i + 1}${rowIsGroup(tr) ? '<span class="tag">备用组</span>' : ''}`;
+      `#${i + 1}${isGroup ? '<span class="tag">备用组</span>' : ''}`;
+    total++;
+    if (isGroup) groups++;
   });
+  const el = $('shareCount');
+  if (el) {
+    el.textContent = total === 0
+      ? '尚未配置分享链接'
+      : `共 ${total} 条${groups > 0 ? `（其中 ${groups} 条为备用链接组）` : ''}`;
+  }
 }
 
 function addShare() {
@@ -614,8 +643,8 @@ async function loadConfig() {
 
 $('addShare').onclick = () => addShare();
 $('reloadBtn').onclick = async () => {
-  try { await loadConfig(); showMsg('cfgMsg', '已重新载入', true); }
-  catch (e) { showMsg('cfgMsg', e.message, false); }
+  try { await loadConfig(); notify('已重新载入', true); }
+  catch (e) { notify(e.message, false); }
 };
 
 $('saveBtn').onclick = async () => {
@@ -677,15 +706,18 @@ $('saveBtn').onclick = async () => {
   $('saveBtn').disabled = true;
   try {
     const d = await api('PUT', '/api/config', out);
-    showMsg('cfgMsg', '保存成功，定时任务已重载（' + d.tasksRegistered + ' 个）'
-      + (d.isSymlink ? '，已正确写入软链接指向的真实文件' : ''), true);
     await loadConfig();
     refreshTasks();
+    // 提示显示在当前可见面板（用户可能已切换 tab）
+    const msgEl = (document.querySelector('.panel.active') || {}).id === 'panel-shares' ? 'shareMsg' : 'cfgMsg';
+    showMsg(msgEl, '保存成功，定时任务已重载（' + d.tasksRegistered + ' 个）'
+      + (d.isSymlink ? '，已正确写入软链接指向的真实文件' : ''), true);
     if (d.taskErrors && d.taskErrors.length) {
-      showMsg('cfgMsg', '配置已保存，但部分 cron 无效：\n- ' + d.taskErrors.join('\n- '), false);
+      showMsg(msgEl, '配置已保存，但部分 cron 无效：\n- ' + d.taskErrors.join('\n- '), false);
     }
   } catch (e) {
-    showMsg('cfgMsg', '保存失败：' + e.message, false);
+    const msgEl = (document.querySelector('.panel.active') || {}).id === 'panel-shares' ? 'shareMsg' : 'cfgMsg';
+    showMsg(msgEl, '保存失败：' + e.message, false);
   } finally {
     $('saveBtn').disabled = false;
   }
