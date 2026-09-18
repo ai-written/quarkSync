@@ -233,7 +233,17 @@ docker compose up -d
 
 首次启动若 `config/config.json` 不存在，会从模板自动生成 —— 记得先填好 `cookie` 和 `webToken` 再重启容器。
 
-以上配置表示每天 11:00 和 20:00 执行同步，11:05 和 20:05 执行 AList 下载。
+#### 自行构建镜像
+
+发布流程：**先改 `package.json` 的版本号并提交，再构建推送**，这样镜像内记录的版本与 tag 才一致。
+
+```bash
+npm run docker:build          # 构建 linux/amd64 + linux/arm64 并推送 latest 与 <版本号>
+npm run docker:build:local    # 仅本地构建（单平台、不推送），用于验证
+```
+
+`docker:build` 会读取 `package.json` 的 `version`，同时打上 `latest` 与 `1.2.0` 这样的版本 tag；
+发布前若工作区有未提交改动、或 HEAD 中的版本与工作区不一致，会给出警告。
 
 ## 工作流程
 

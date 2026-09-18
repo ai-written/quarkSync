@@ -8,4 +8,6 @@ logs
 config
 .git
 .gitignore
+.gitattributes
+scripts
 *.md
