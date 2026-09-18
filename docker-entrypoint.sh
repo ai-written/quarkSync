@@ -17,14 +17,9 @@ ln -sf /app/config/config.json /app/config.json
 touch /app/logs/sync.log
 ln -sf /app/logs/sync.log /app/sync.log
 
-# Run initial sync on every startup
-echo "[Entrypoint] Running initial sync..."
-node index.js || true
-
-# Run initial alist download
-echo "[Entrypoint] Running initial alist download..."
-node index.js alist || true
-
-echo "[Entrypoint] Initial tasks done, starting main process..."
+# 启动时的首次同步/AList 下载改由 web 进程执行：
+# 这样可以与 cron、网页手动触发共用同一把进程内互斥锁，避免并发重复转存；
+# 同时也不会像以前那样把网页服务的启动阻塞到首次任务跑完。
+echo "[Entrypoint] Starting main process (startup tasks are handled by the app)..."
 
 exec "$@"

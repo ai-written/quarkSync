@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quark-sync 管理面板</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+         background: #f5f6f8; color: #1f2328; font-size: 14px; overflow: hidden; }
+  header { background: #1f6feb; color: #fff; padding: 12px 20px; display: flex; align-items: center; gap: 12px;
+           flex: none; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sp { flex: 1; }
+  header button { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.4); }
+  /* 布局：header 与 tabs 固定，只有当前 tab 的面板滚动 */
+  #app { height: 100vh; flex-direction: column; }
+  .wrap { flex: 1; min-height: 0; display: flex; flex-direction: column;
+          width: 100%; max-width: 1080px; margin: 0 auto; padding: 20px 20px 0; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #d0d7de; flex: none; }
+  .tabs button { background: none; border: none; padding: 9px 16px; cursor: pointer; color: #57606a;
+                 border-bottom: 2px solid transparent; font-size: 14px; }
+  .tabs button.active { color: #1f6feb; border-bottom-color: #1f6feb; font-weight: 600; }
+  .panel { display: none; }
+  /* 底部留白由 .savebar / 面板内最后一个元素自己处理，否则保存栏会浮在底部上方 */
+  .panel.active { display: block; flex: 1; min-height: 0; overflow-y: auto;
+                  scrollbar-gutter: stable; }
+  /* 日志面板改为内部滚动（工具栏保持可见），避免内外双滚动条 */
+  #panel-logs.active { display: flex; flex-direction: column; overflow: hidden; }
+  #panel-logs .card { flex: 1; min-height: 0; display: flex; flex-direction: column; margin-bottom: 20px; }
+  #panel-logs .filters { flex: none; }
+  /* 非配置面板的底部留白 */
+  #panel-logs, #panel-tasks { padding-bottom: 20px; }
+  .card { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 16px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; margin: 0 0 12px; color: #1f2328; }
+  .grid { display: grid; grid-template-columns: 180px 1fr; gap: 10px 14px; align-items: center; }
+  .grid label { color: #57606a; }
+
+  /* 可折叠的一级卡片 */
+  .card > .card-hd { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  .card > .card-hd h2 { margin: 0; flex: 1; }
+  .card > .card-hd .chev { color: #8b949e; font-size: 11px; line-height: 1;
+                           transition: transform .15s ease; transform-origin: center; }
+  .card.collapsed > .card-hd .chev { transform: rotate(-90deg); }
+  .card.collapsed > .card-bd { display: none; }
+  .card > .card-hd:hover h2 { color: #1f6feb; }
+
+  /* 二级卡片 */
+  .subcard { border: 1px solid #e6e9ec; border-radius: 6px; padding: 14px;
+             margin-bottom: 12px; background: #fcfcfd; }
+  .subcard:last-child { margin-bottom: 0; }
+  .subcard > h3 { font-size: 13px; margin: 0 0 10px; color: #1f2328; font-weight: 600; }
+  .subcard .grid { grid-template-columns: 150px 1fr; }
+
+  /* 分享链接表格 */
+  .tablewrap { overflow-x: auto; border: 1px solid #e6e9ec; border-radius: 6px; background: #fff; }
+  table.share-table { width: 100%; min-width: 860px; border-collapse: collapse; }
+  table.share-table th { font-size: 12px; color: #57606a; font-weight: 600; text-align: left;
+                         padding: 7px 8px; background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+                         white-space: nowrap; }
+  table.share-table td { padding: 6px 8px; border-bottom: 1px solid #eef0f2; vertical-align: middle; }
+  table.share-table tr:last-child td { border-bottom: none; }
+  /* 表格内所有控件统一高度，避免输入框 27px / 按钮 33px 这类错位 */
+  table.share-table input, table.share-table button {
+    height: 28px; padding: 4px 7px; font-size: 13px; }
+  table.share-table textarea {
+    height: auto; min-height: 28px; padding: 4px 7px; font-size: 13px;
+    line-height: 1.35; resize: vertical; }
+  table.share-table button { padding: 4px 10px; }
+  table.share-table .idx { color: #8b949e; font-size: 12px; white-space: nowrap; }
+  table.share-table .idx .tag { display: inline-block; margin-left: 3px; padding: 0 4px;
+                                border-radius: 3px; background: #dbeafe; color: #1e40af; font-size: 10px; }
+  table.share-table .col-act { text-align: right; white-space: nowrap; }
+  .share-empty { padding: 14px; text-align: center; color: #8b949e; font-size: 13px; }
+  input[type=text], input[type=password], input[type=number], select, textarea {
+    width: 100%; padding: 6px 9px; border: 1px solid #d0d7de; border-radius: 6px; font: inherit; background: #fff; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid #1f6feb33; border-color: #1f6feb; }
+  input[type=checkbox] { width: auto; }
+  button { padding: 6px 14px; border: 1px solid #d0d7de; background: #f6f8fa; border-radius: 6px;
+           cursor: pointer; font: inherit; }
+  button:hover { background: #eef1f4; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:hover { background: #1a5fd0; }
+  button.danger { color: #b62222; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .share { border: 1px solid #d0d7de; border-radius: 6px; padding: 12px; margin-bottom: 10px; background: #fafbfc; }
+  .share .row { display: grid; grid-template-columns: 92px 1fr; gap: 8px 10px; align-items: center; margin-bottom: 7px; }
+  .share .hd { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .share .hd b { font-size: 13px; }
+  .hint { color: #8b949e; font-size: 12px; }
+  .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .msg { padding: 9px 12px; border-radius: 6px; margin-bottom: 12px; display: none; white-space: pre-wrap; }
+  .msg.ok { background: #dafbe1; color: #0a5222; border: 1px solid #a7e0b8; display: block; }
+  .msg.err { background: #ffebe9; color: #8b1a1a; border: 1px solid #ffc1bd; display: block; }
+  pre.logs { background: #0d1117; color: #c9d1d9; padding: 12px; border-radius: 6px; overflow: auto;
+             flex: 1; min-height: 0; max-height: none; font-size: 12px; line-height: 1.55; margin: 0;
+             white-space: pre-wrap; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e6e9ec; }
+  th { color: #57606a; font-weight: 600; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .badge.run { background: #fff3cd; color: #7a5b00; }
+  .badge.idle { background: #e8eaed; color: #57606a; }
+  .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .filters input, .filters select { width: auto; }
+  #login { display: none; height: 100vh; overflow: auto; padding: 20px;
+           align-items: center; justify-content: center; }
+  #login .card { width: 100%; max-width: 340px; margin-bottom: 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  /* 底部保存栏：吸在配置面板底部；panel 不再有 padding-bottom，
+     因此它能紧贴滚动区域下沿（padding 已并入 savebar 自身） */
+  .savebar { position: sticky; bottom: 0; z-index: 2; background: #f5f6f8;
+             padding: 12px 0 20px; border-top: 1px solid #e0e3e6; margin: 0; }
+</style>
+</head>
+<body>
+
+<div id="login" style="display:none">
+  <div class="card">
+    <h2>quark-sync 管理面板</h2>
+    <div id="loginMsg" class="msg"></div>
+    <div class="grid" style="grid-template-columns:1fr">
+      <input type="password" id="token" placeholder="请输入 webToken" autocomplete="current-password">
+      <button class="primary" id="loginBtn" style="width:100%">登录</button>
+    </div>
+    <p class="hint" style="margin:12px 0 0">Token 在 config.json 的 <code>webToken</code> 字段中配置。</p>
+  </div>
+</div>
+
+<div id="app" style="display:none">
+  <header>
+    <h1>quark-sync 管理面板</h1>
+    <span class="sp"></span>
+    <span id="runningBadge" class="hint" style="color:#fff"></span>
+    <button id="logoutBtn">退出</button>
+  </header>
+
+  <div class="wrap">
+    <div class="tabs">
+      <button data-tab="config" class="active">配置</button>
+      <button data-tab="logs">日志</button>
+      <button data-tab="tasks">任务</button>
+    </div>
+
+    <!-- ============ 配置 ============ -->
+    <div class="panel active" id="panel-config">
+      <div id="cfgMsg" class="msg"></div>
+
+      <!-- ===== 一级：账号与目标 ===== -->
+      <div class="card" data-card="account">
+        <div class="card-hd"><h2>账号与目标</h2><span class="chev">▼</span></div>
+        <div class="card-bd">
+          <div class="subcard">
+            <h3>夸克账号</h3>
+            <div class="grid">
+              <label>Cookie</label>
+              <div>
+                <input type="password" id="cookie" placeholder="粘贴夸克网盘完整 Cookie">
+                <div class="hint">出于安全考虑不回显原值；留空表示保持不变。</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="subcard">
+            <h3>转存目标</h3>
+            <div class="grid">
+              <label>目标文件夹名</label>
+              <input type="text" id="targetDirName" placeholder="来自：分享">
+              <label>目标文件夹 ID</label>
+              <input type="text" id="targetDirFid" placeholder="优先级高于文件夹名，留空则用名称查找">
+              <label>文件名前缀 tip</label>
+              <input type="text" id="tip" placeholder="如：遮天-">
+              <label>默认提取码</label>
+              <input type="text" id="password" placeholder="分享默认提取码">
+            </div>
+          </div>
+
+          <div class="subcard">
+            <h3>分享链接 <span class="hint">（每项可单独覆盖时间窗口 / 最小体积 / 数量限制）</span></h3>
+            <div class="tablewrap">
+              <table class="share-table">
+                <thead>
+                  <tr>
+                    <th style="width:44px">#</th>
+                    <th style="width:110px">前缀 tip</th>
+                    <th style="min-width:220px">链接</th>
+                    <th style="width:82px">提取码</th>
+                    <th style="width:88px">时间窗口</th>
+                    <th style="width:82px">最小 MB</th>
+                    <th style="width:82px">最多数量</th>
+                    <th style="width:64px"></th>
+                  </tr>
+                </thead>
+                <tbody id="shareBody"></tbody>
+              </table>
+            </div>
+            <div class="actions" style="margin-top:10px">
+              <button id="addShare">+ 添加分享</button>
+            </div>
+            <div class="hint" style="margin-top:8px">
+              链接格一行一个链接；写多行即为「备用链接组」，按顺序 failover（前一个失效才试下一个）。<br>
+              覆盖项留空 = 继承全局；填 0 = 显式覆盖（最小体积/数量为不限制）。
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 一级：同步与下载 ===== -->
+      <div class="card" data-card="sync">
+        <div class="card-hd"><h2>同步与下载</h2><span class="chev">▼</span></div>
+        <div class="card-bd">
+          <div class="subcard">
+            <h3>筛选与转存</h3>
+            <div class="grid">
+              <label>时间窗口 hours</label>
+              <div>
+                <input type="number" id="hours" min="0">
+                <div class="hint">只转存该小时数内更新的文件。注意填 0 会转存不了任何文件。</div>
+              </div>
+              <label>最小文件大小 MB</label>
+              <div>
+                <input type="number" id="minFileSizeMB" min="0">
+                <div class="hint">0 表示不过滤。</div>
+              </div>
+              <label>每分享最多转存</label>
+              <div>
+                <input type="number" id="maxFilesPerShare" min="0">
+                <div class="hint">0 表示不限制。</div>
+              </div>
+              <label>轮询间隔 ms</label>
+              <input type="number" id="pollInterval" min="0">
+              <label>自动清理失效链接</label>
+              <div>
+                <input type="checkbox" id="pruneDeadShares">
+                <span class="hint">任务执行后自动从配置中移除「确定失效」的分享链接（临时网络故障不会误删，仅报告）</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="subcard">
+            <h3>下载与清理</h3>
+            <div class="grid">
+              <label>下载目录</label>
+              <input type="text" id="downloadDir" placeholder="./downloads">
+              <label>下载后删除云端</label>
+              <div><input type="checkbox" id="deleteAfterDownload"> <span class="hint">下载成功后删除网盘文件</span></div>
+              <label>过期清理天数</label>
+              <div>
+                <input type="number" id="cleanupAfterDays" min="0">
+                <div class="hint">自动删除 N 天前同步的文件（云端 + 本地），0 禁用。</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="subcard">
+            <h3>AList</h3>
+            <div class="grid">
+              <label>AList 地址</label>
+              <input type="text" id="alistUrl" placeholder="http://127.0.0.1:19336">
+              <label>AList 路径</label>
+              <input type="text" id="alistPath" placeholder="/kuake/来自：分享">
+              <label>AList Token</label>
+              <input type="text" id="alistToken">
+              <label>绕过缓存</label>
+              <div><input type="checkbox" id="alistRefresh"> <span class="hint">需管理员权限</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 一级：服务与调度 ===== -->
+      <div class="card" data-card="service">
+        <div class="card-hd"><h2>服务与调度</h2><span class="chev">▼</span></div>
+        <div class="card-bd">
+          <div class="subcard">
+            <h3>定时任务</h3>
+            <div class="grid">
+              <label>同步 cron</label>
+              <div>
+                <input type="text" id="syncCron" placeholder="0 11 * * *">
+                <div class="hint">多个用英文逗号分隔，例如：0 11 * * *, 0 20 * * *</div>
+              </div>
+              <label>AList cron</label>
+              <div>
+                <input type="text" id="alistCron" placeholder="0 3 * * *">
+                <div class="hint">多个用英文逗号分隔。</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="subcard">
+            <h3>网页服务</h3>
+            <div class="grid">
+              <label>监听端口</label>
+              <input type="number" id="webPort" min="1" max="65535">
+              <label>监听地址</label>
+              <div>
+                <select id="webHost">
+                  <option value="0.0.0.0">0.0.0.0（局域网可访问）</option>
+                  <option value="127.0.0.1">127.0.0.1（仅本机）</option>
+                </select>
+              </div>
+              <label>网页 Token</label>
+              <div>
+                <input type="password" id="webToken" placeholder="至少 8 位；留空表示保持不变">
+                <div class="hint">修改后立即生效，旧 Token 失效（已登录会话仍有效）。</div>
+              </div>
+              <label>启动时同步</label>
+              <div>
+                <input type="checkbox" id="runOnStartup"> <span class="hint">web 模式启动后立即跑一次同步与 AList 下载</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="actions savebar">
+        <button class="primary" id="saveBtn">保存配置</button>
+        <button id="reloadBtn">放弃修改并重新载入</button>
+        <span class="hint" id="saveHint"></span>
+      </div>
+    </div>
+
+    <!-- ============ 日志 ============ -->
+    <div class="panel" id="panel-logs">
+      <div class="card">
+        <div class="filters">
+          <select id="logLevel">
+            <option value="">全部级别</option>
+            <option value="INFO">INFO</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+          <input type="text" id="logKeyword" placeholder="关键字过滤">
+          <input type="number" id="logLines" value="200" min="1" max="5000" style="width:90px">
+          <button id="logRefresh" class="primary">刷新</button>
+          <label class="hint"><input type="checkbox" id="logAuto"> 自动刷新(5s)</label>
+        </div>
+        <pre class="logs" id="logBox">加载中…</pre>
+        <p class="hint" id="logMeta" style="margin:8px 0 0"></p>
+      </div>
+    </div>
+
+    <!-- ============ 任务 ============ -->
+    <div class="panel" id="panel-tasks">
+      <div id="taskMsg" class="msg"></div>
+      <div class="card">
+        <h2>定时任务</h2>
+        <table>
+          <thead><tr><th>任务</th><th>cron</th><th>状态</th><th>下次运行</th><th style="width:110px">操作</th></tr></thead>
+          <tbody id="taskRows"></tbody>
+        </table>
+        <p class="hint" style="margin:10px 0 0">修改 cron 后请到「配置」页保存，任务会自动重载。</p>
+      </div>
+      <div class="card">
+        <h2>手动触发</h2>
+        <table>
+          <thead><tr><th>任务</th><th>状态</th><th style="width:110px">操作</th></tr></thead>
+          <tbody id="manualRows"></tbody>
+        </table>
+        <p class="hint" style="margin:10px 0 0">同一时间只允许一个任务运行，重复触发会被拒绝。</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const UNCHANGED = '__UNCHANGED__';
+const $ = id => document.getElementById(id);
+let currentConfig = null;
+
+function showMsg(el, text, ok) {
+  const e = $(el);
+  e.textContent = text;
+  e.className = 'msg ' + (ok ? 'ok' : 'err');
+  if (ok) setTimeout(() => { if (e.textContent === text) e.className = 'msg'; }, 4000);
+}
+
+async function api(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(url, opts);
+  let data = null;
+  try { data = await r.json(); } catch {}
+  if (r.status === 401) { showLogin(); throw new Error('未登录'); }
+  if (!r.ok) {
+    const detail = data && data.details ? '\n- ' + data.details.join('\n- ') : '';
+    throw new Error((data && data.error || ('HTTP ' + r.status)) + detail);
+  }
+  return data;
+}
+
+function showLogin() {
+  $('login').style.display = 'flex';   // 用 flex 才能垂直居中
+  $('app').style.display = 'none';
+}
+function showApp() {
+  $('login').style.display = 'none';
+  $('app').style.display = 'flex';     // 用 flex 让面板自己滚动
+}
+
+// ---------- 登录 ----------
+$('loginBtn').onclick = async () => {
+  const token = $('token').value;
+  if (!token) { showMsg('loginMsg', '请输入 Token', false); return; }
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || '登录失败');
+    $('token').value = '';
+    showApp();
+    await loadConfig();
+    refreshTasks();
+  } catch (e) { showMsg('loginMsg', e.message, false); }
+};
+$('token').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginBtn').click(); });
+
+$('logoutBtn').onclick = async () => {
+  await fetch('/api/logout', { method: 'POST' });
+  showLogin();
+};
+
+// ---------- 标签页 ----------
+document.querySelectorAll('.tabs button').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('.tabs button').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    $('panel-' + b.dataset.tab).classList.add('active');
+    if (b.dataset.tab === 'logs') loadLogs();
+    if (b.dataset.tab === 'tasks') refreshTasks();
+  };
+});
+
+// ---------- 配置 ----------
+function cronToInput(v) {
+  if (Array.isArray(v)) return v.join(', ');
+  return v == null ? '' : String(v);
+}
+function inputToCron(s) {
+  const parts = String(s || '').split(',').map(x => x.trim()).filter(Boolean);
+  if (parts.length === 0) return '';
+  return parts.length === 1 ? parts[0] : parts;
+}
+
+function numOrUndef(v) {
+  if (v === '' || v == null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+// 转义后再插入 HTML 模板：配置值可能含引号或 < >（如 tip、password、URL），
+// 不转义会提前闭合属性、甚至被当作标签解析
+function esc(v) {
+  return String(v ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// 分享链接表格：每行一个分享；链接格写多行即为「备用链接组」（按序 failover）
+// 是否为分组只取决于内容（多行），不再靠按钮预设，因此标签会随输入实时变化
+function rowIsGroup(tr) {
+  const el = tr.querySelector('[data-f=url]');
+  if (!el) return false;
+  return el.value.split('\n').map(s => s.trim()).filter(Boolean).length > 1;
+}
+
+function renderShares(list) {
+  const body = $('shareBody');
+  body.innerHTML = '';
+  const rows = (list || []);
+  if (rows.length === 0) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td colspan="8" class="share-empty">暂无分享链接，点击下方按钮添加</td>';
+    body.appendChild(tr);
+    return;
+  }
+  rows.forEach(item => {
+    const isStr = typeof item === 'string';
+    const obj = isStr ? { url: item } : item;
+    const urlIsArr = Array.isArray(obj.url);
+    const urlText = urlIsArr ? obj.url.join('\n') : (obj.url || '');
+
+    const tr = document.createElement('tr');
+    tr.className = 'share-row';
+    tr.innerHTML = `
+      <td class="idx"></td>
+      <td><input type="text" data-f="tip" value="${esc(obj.tip)}" placeholder="继承"></td>
+      <td><textarea rows="${urlIsArr ? 3 : 1}" data-f="url"
+            placeholder="https://pan.quark.cn/s/xxxxxx&#10;（换行填写多个即为备用链接组）">${esc(urlText)}</textarea></td>
+      <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="继承"></td>
+      <td><input type="number" min="0" data-f="hours" value="${esc(obj.hours)}" placeholder="继承"></td>
+      <td><input type="number" min="0" data-f="minFileSizeMB" value="${esc(obj.minFileSizeMB)}" placeholder="继承"></td>
+      <td><input type="number" min="0" data-f="maxFilesPerShare" value="${esc(obj.maxFilesPerShare)}" placeholder="继承"></td>
+      <td class="col-act"><button class="danger" data-act="del">删除</button></td>
+    `;
+    tr.querySelector('[data-act=del]').onclick = () => {
+      tr.remove();
+      if ($('shareBody').querySelectorAll('tr.share-row').length === 0) renderShares([]);
+      else renumber();
+    };
+    // 输入时实时刷新「备用组」标记与文本框高度
+    const urlEl = tr.querySelector('[data-f=url]');
+    urlEl.addEventListener('input', () => {
+      const n = urlEl.value.split('\n').filter(s => s.trim()).length;
+      if (n > 1 && Number(urlEl.rows) < Math.min(n, 6)) urlEl.rows = Math.min(n, 6);
+      renumber();
+    });
+    body.appendChild(tr);
+  });
+  renumber();
+}
+
+function renumber() {
+  $('shareBody').querySelectorAll('tr.share-row').forEach((tr, i) => {
+    tr.querySelector('.idx').innerHTML =
+      `#${i + 1}${rowIsGroup(tr) ? '<span class="tag">备用组</span>' : ''}`;
+  });
+}
+
+function addShare() {
+  const existing = collectShares();
+  existing.push({ url: '' });
+  renderShares(existing);
+  // 聚焦到新行的链接框，便于直接粘贴
+  const rows = $('shareBody').querySelectorAll('tr.share-row');
+  const last = rows[rows.length - 1];
+  if (last) last.querySelector('[data-f=url]').focus();
+}
+
+function collectShares() {
+  const out = [];
+  $('shareBody').querySelectorAll('tr.share-row').forEach(tr => {
+    const g = f => {
+      const el = tr.querySelector(`[data-f=${f}]`);
+      if (!el) return undefined;
+      const v = el.value.trim();
+      return v === '' ? undefined : v;
+    };
+    const urlEl = tr.querySelector('[data-f=url]');
+    const lines = urlEl.value.split('\n').map(s => s.trim()).filter(Boolean);
+    const asArr = lines.length > 1;
+    const url = asArr ? lines : (lines[0] || '');
+
+    const o = {};
+    if (asArr ? lines.length > 0 : url !== '') o.url = url;
+    const pw = g('password'); if (pw !== undefined) o.password = pw;
+    const tip = g('tip'); if (tip !== undefined) o.tip = tip;
+    for (const k of ['hours', 'minFileSizeMB', 'maxFilesPerShare']) {
+      const v = g(k);
+      if (v !== undefined) o[k] = Number(v);
+    }
+    // 纯字符串形式（只有 url、无其它字段）保持字符串，兼容旧配置
+    const keys = Object.keys(o);
+    if (!asArr && keys.length === 1 && keys[0] === 'url') out.push(o.url);
+    else out.push(o);
+  });
+  return out;
+}
+
+// 一级卡片折叠：状态只存内存，不写入配置
+function initCollapsibleCards() {
+  document.querySelectorAll('#panel-config .card[data-card] > .card-hd').forEach(hd => {
+    hd.onclick = () => hd.parentElement.classList.toggle('collapsed');
+  });
+}
+
+async function loadConfig() {
+  const d = await api('GET', '/api/config');
+  currentConfig = d.config;
+  const c = d.config;
+
+  $('cookie').value = '';
+  $('cookie').placeholder = c.__cookieSet ? '已配置（' + c.cookie + '），留空保持不变' : '粘贴夸克网盘完整 Cookie';
+  $('webToken').value = '';
+  $('webToken').placeholder = c.__webTokenSet ? '已配置（' + c.webToken + '），留空保持不变' : '至少 8 位';
+
+  $('targetDirName').value = c.targetDirName ?? '';
+  $('targetDirFid').value = c.targetDirFid ?? '';
+  $('tip').value = c.tip ?? '';
+  $('password').value = c.password ?? '';
+  $('hours').value = c.hours ?? '';
+  $('minFileSizeMB').value = c.minFileSizeMB ?? '';
+  $('maxFilesPerShare').value = c.maxFilesPerShare ?? '';
+  $('pollInterval').value = c.pollInterval ?? '';
+  $('downloadDir').value = c.downloadDir ?? '';
+  $('deleteAfterDownload').checked = Boolean(c.deleteAfterDownload);
+  $('cleanupAfterDays').value = c.cleanupAfterDays ?? '';
+  $('alistUrl').value = c.alistUrl ?? '';
+  $('alistPath').value = c.alistPath ?? '';
+  $('alistToken').value = c.alistToken ?? '';
+  $('alistRefresh').checked = Boolean(c.alistRefresh);
+  $('syncCron').value = cronToInput(c.syncCron);
+  $('alistCron').value = cronToInput(c.alistCron);
+  $('webPort').value = c.webPort ?? 3000;
+  $('webHost').value = c.webHost === '127.0.0.1' ? '127.0.0.1' : '0.0.0.0';
+  // 未设置时默认启用（与后端 config.runOnStartup !== false 一致）
+  $('runOnStartup').checked = c.runOnStartup !== false;
+  $('pruneDeadShares').checked = c.pruneDeadShares === true;
+
+  const su = c.shareUrls ?? (c.shareUrl ? [c.shareUrl] : []);
+  renderShares(su);
+  $('saveHint').textContent = '配置文件：' + d.configPath;
+}
+
+$('addShare').onclick = () => addShare();
+$('reloadBtn').onclick = async () => {
+  try { await loadConfig(); showMsg('cfgMsg', '已重新载入', true); }
+  catch (e) { showMsg('cfgMsg', e.message, false); }
+};
+
+$('saveBtn').onclick = async () => {
+  if (!currentConfig) return;
+  const out = {};
+  // 保留未知字段，避免丢失手写配置
+  for (const k of Object.keys(currentConfig)) {
+    if (k.startsWith('__')) continue;
+    out[k] = currentConfig[k];
+  }
+
+  const setStr = (k, el) => { const v = $(el).value.trim(); if (v === '') delete out[k]; else out[k] = v; };
+  setStr('targetDirName', 'targetDirName');
+  setStr('targetDirFid', 'targetDirFid');
+  setStr('tip', 'tip');
+  setStr('password', 'password');
+  setStr('downloadDir', 'downloadDir');
+  setStr('alistUrl', 'alistUrl');
+  setStr('alistPath', 'alistPath');
+  setStr('alistToken', 'alistToken');
+
+  const setNum = (k, el) => { const v = numOrUndef($(el).value); if (v === undefined) delete out[k]; else out[k] = v; };
+  setNum('hours', 'hours');
+  setNum('minFileSizeMB', 'minFileSizeMB');
+  setNum('maxFilesPerShare', 'maxFilesPerShare');
+  setNum('pollInterval', 'pollInterval');
+  setNum('cleanupAfterDays', 'cleanupAfterDays');
+  setNum('webPort', 'webPort');
+
+  out.deleteAfterDownload = $('deleteAfterDownload').checked;
+  out.alistRefresh = $('alistRefresh').checked;
+  out.runOnStartup = $('runOnStartup').checked;
+  out.pruneDeadShares = $('pruneDeadShares').checked;
+  out.webHost = $('webHost').value;
+
+  const sc = inputToCron($('syncCron').value);
+  if (sc === '') delete out.syncCron; else out.syncCron = sc;
+  const ac = inputToCron($('alistCron').value);
+  if (ac === '') delete out.alistCron; else out.alistCron = ac;
+
+  const shares = collectShares().filter(s => {
+    if (typeof s === 'string') return s !== '';
+    return s.url !== undefined && !(Array.isArray(s.url) && s.url.length === 0);
+  });
+  if (shares.length > 0) {
+    out.shareUrls = shares;
+    delete out.shareUrl;
+  } else {
+    delete out.shareUrls;
+    delete out.shareUrl;
+  }
+
+  // 密钥：留空 = 保持不变
+  const ck = $('cookie').value.trim();
+  out.cookie = ck === '' ? UNCHANGED : ck;
+  const wt = $('webToken').value.trim();
+  out.webToken = wt === '' ? UNCHANGED : wt;
+
+  $('saveBtn').disabled = true;
+  try {
+    const d = await api('PUT', '/api/config', out);
+    showMsg('cfgMsg', '保存成功，定时任务已重载（' + d.tasksRegistered + ' 个）'
+      + (d.isSymlink ? '，已正确写入软链接指向的真实文件' : ''), true);
+    await loadConfig();
+    refreshTasks();
+    if (d.taskErrors && d.taskErrors.length) {
+      showMsg('cfgMsg', '配置已保存，但部分 cron 无效：\n- ' + d.taskErrors.join('\n- '), false);
+    }
+  } catch (e) {
+    showMsg('cfgMsg', '保存失败：' + e.message, false);
+  } finally {
+    $('saveBtn').disabled = false;
+  }
+};
+
+// ---------- 日志 ----------
+let logTimer = null;
+async function loadLogs() {
+  const q = new URLSearchParams({
+    lines: $('logLines').value || '200',
+    level: $('logLevel').value,
+    keyword: $('logKeyword').value.trim(),
+  });
+  try {
+    const d = await api('GET', '/api/logs?' + q);
+    $('logBox').textContent = d.lines.length ? d.lines.join('\n') : '（暂无匹配日志）';
+    $('logMeta').textContent = '显示 ' + d.lines.length + ' 行'
+      + (d.truncated ? '（结果过多已截断，可缩小范围）' : '')
+      + ' · ' + new Date().toLocaleTimeString('zh-CN');
+    $('logBox').scrollTop = $('logBox').scrollHeight;
+  } catch (e) {
+    $('logBox').textContent = '加载失败：' + e.message;
+  }
+}
+$('logRefresh').onclick = loadLogs;
+$('logLevel').onchange = loadLogs;
+$('logKeyword').addEventListener('keydown', e => { if (e.key === 'Enter') loadLogs(); });
+$('logAuto').onchange = () => {
+  if ($('logAuto').checked) logTimer = setInterval(loadLogs, 5000);
+  else { clearInterval(logTimer); logTimer = null; }
+};
+
+// ---------- 任务 ----------
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+async function refreshTasks() {
+  try {
+    const d = await api('GET', '/api/tasks');
+    const running = d.running || [];
+    $('runningBadge').textContent = running.length ? '运行中: ' + running.join(', ') : '';
+
+    const rows = $('taskRows');
+    rows.innerHTML = '';
+    if (!d.tasks.length) {
+      rows.innerHTML = '<tr><td colspan="5" class="hint">未配置 syncCron / alistCron</td></tr>';
+    }
+    d.tasks.forEach(t => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${esc(t.name)}</td><td class="mono">${esc(t.cron)}</td>
+        <td><span class="badge ${t.running ? 'run' : 'idle'}">${t.running ? '运行中' : '等待中'}</span></td>
+        <td>${esc(fmtTime(t.nextRun))}</td>`;
+      const td = document.createElement('td');
+      const b = document.createElement('button');
+      b.textContent = '立即执行';
+      b.disabled = t.running || running.length > 0;
+      b.onclick = () => trigger(t.key, b);
+      td.appendChild(b);
+      tr.appendChild(td);
+      rows.appendChild(tr);
+    });
+
+    const mrows = $('manualRows');
+    mrows.innerHTML = '';
+    (d.manual || []).forEach(m => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${esc(m.name)}</td>
+        <td><span class="badge ${m.running ? 'run' : 'idle'}">${m.running ? '运行中' : '空闲'}</span></td>`;
+      const td = document.createElement('td');
+      const b = document.createElement('button');
+      b.textContent = '立即执行';
+      b.disabled = m.running || running.length > 0;
+      b.onclick = () => trigger(m.key, b);
+      td.appendChild(b);
+      tr.appendChild(td);
+      mrows.appendChild(tr);
+    });
+  } catch (e) {
+    // 未登录时 api() 已处理跳转
+  }
+}
+
+async function trigger(key, btn) {
+  btn.disabled = true;
+  try {
+    await api('POST', '/api/run', { key });
+    showMsg('taskMsg', '任务已启动，可在上方查看运行状态', true);
+    setTimeout(refreshTasks, 600);
+    setTimeout(refreshTasks, 2500);
+  } catch (e) {
+    showMsg('taskMsg', '触发失败：' + e.message, false);
+    btn.disabled = false;
+  }
+}
+
+// 定时刷新任务状态
+setInterval(() => { if ($('app').style.display !== 'none') refreshTasks(); }, 5000);
+
+// ---------- 启动 ----------
+initCollapsibleCards();
+(async () => {
+  try {
+    const r = await fetch('/api/session');
+    const d = await r.json();
+    if (!d.authRequired) {
+      showMsg('loginMsg', '服务端未配置 webToken，网页功能已禁用。请在 config.json 设置 webToken 后重启。', false);
+      showLogin();
+      $('loginBtn').disabled = true;
+      $('token').disabled = true;
+      return;
+    }
+    if (d.authenticated) { showApp(); await loadConfig(); refreshTasks(); }
+    else showLogin();
+  } catch {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>
