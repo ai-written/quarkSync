@@ -517,7 +517,7 @@ function renderShares(list) {
       <td><textarea rows="${urlIsArr ? 3 : 1}" data-f="url"
             placeholder="https://pan.quark.cn/s/xxxxxx&#10;（换行填写多个即为备用链接组）">${esc(urlText)}</textarea></td>
       <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="继承"></td>
-      <td><input type="text" min="0" data-f="hours" value="${esc(obj.hours)}" placeholder="继承"></td>
+      <td><input type="text" data-f="hours" value="${esc(obj.hours)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="minFileSizeMB" value="${esc(obj.minFileSizeMB)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="maxFilesPerShare" value="${esc(obj.maxFilesPerShare)}" placeholder="继承"></td>
       <td class="col-act"><button class="danger" data-act="del">删除</button></td>

@@ -155,8 +155,10 @@ function validateConfig(c) {
   optionalInt('webPort', 1);
   optionalInt('days', 0);
 
-  // hours 支持单位写法（1h / 1d / 1w / 1mo / 1y / 30m）或纯数字（按小时）
-  if (c.hours !== undefined && !isValidDuration(c.hours)) {
+  // hours 支持单位写法（1h / 1d / 1w / 1mo / 1y / 30m）或纯数字（按小时）。
+  // null 与空串在运行时被视为「未配置」（回退默认值），校验时同样放行，
+  // 避免出现「能跑但存不了」的不一致。
+  if (c.hours !== undefined && c.hours !== null && c.hours !== '' && !isValidDuration(c.hours)) {
     errors.push('hours 需要是数字（按小时）或时长写法，如 24、1h、1d、1w、1mo、1y、30m');
   }
 
@@ -185,8 +187,8 @@ function validateConfig(c) {
         } else if (typeof u !== 'string' && !(Array.isArray(u) && u.every(x => typeof x === 'string'))) {
           errors.push(`shareUrls[${i}].url 必须是字符串或字符串数组`);
         }
-        // 每项的 hours 同样支持单位写法
-        if (item.hours !== undefined && !isValidDuration(item.hours)) {
+        // 每项的 hours 同样支持单位写法；null / 空串视为未配置（继承全局）
+        if (item.hours !== undefined && item.hours !== null && item.hours !== '' && !isValidDuration(item.hours)) {
           errors.push(`shareUrls[${i}].hours 需要是数字（按小时）或时长写法，如 6、12h、1d`);
         }
         for (const k of ['minFileSizeMB', 'maxFilesPerShare']) {

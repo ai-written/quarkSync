@@ -1102,14 +1102,17 @@ function formatHours(hours) {
 }
 
 // 解决全局时间窗口：hours 优先，其次历史字段 days（按天），否则默认 48 小时。
-// hours 支持单位写法；days 是旧配置里的纯数值（单位: 天），单独按其原语义换算。
+// hours 支持单位写法；days 是旧配置里的纯数值（单位: 天）。
+// 注意 days 沿用旧实现的三元判断语义（falsy 即视为未配置），因此 days:0
+// 会回退到默认 48 小时 —— 这样既保持向后兼容，也避免误配成「0 天窗口」
+// 导致什么都转存不了。
 function resolveWindowHours(config) {
   if (config.hours !== undefined && config.hours !== null && config.hours !== '') {
     return parseDurationHours(config.hours, 48);
   }
-  if (config.days !== undefined && config.days !== null && config.days !== '') {
+  if (config.days) {
     const n = Number(config.days);
-    if (Number.isFinite(n) && n >= 0) return n * 24;
+    if (Number.isFinite(n) && n > 0) return n * 24;
   }
   return 48;
 }
@@ -1138,6 +1141,11 @@ async function syncInternal(config) {
   // 时间窗口支持 1h / 1d / 1w / 1mo / 1y / 30m 等单位写法（纯数字按小时，兼容旧配置）。
   // days 为历史字段（数值按天计），仅在没有 hours 时生效。
   const hours = resolveWindowHours(config);
+  if (config.hours !== undefined && config.hours !== null && config.hours !== ''
+      && !isValidDuration(config.hours)) {
+    logError(`   ⚠ hours 取值无法识别: ${JSON.stringify(config.hours)}，已回退为 48 小时`
+      + '（支持写法: 24、1h、1d、1w、1mo、1y、30m）');
+  }
   const pollInterval = config.pollInterval || 1000;
 
   const client = new QuarkClient(config.cookie);
@@ -1163,9 +1171,14 @@ async function syncInternal(config) {
     const { url, password, tip, hours: itemHours, minFileSizeMB: itemMinSizeMB, maxFilesPerShare: itemMaxFiles } = shareUrls[si];
     const shareTip = tip || config.tip;
     // 每项分享也可单独覆盖时间窗口，同样支持单位写法
-    const shareHours = itemHours !== undefined && itemHours !== null && itemHours !== ''
-      ? parseDurationHours(itemHours, hours)
-      : hours;
+    let shareHours = hours;
+    if (itemHours !== undefined && itemHours !== null && itemHours !== '') {
+      shareHours = parseDurationHours(itemHours, hours);
+      if (!isValidDuration(itemHours)) {
+        logError(`   ⚠ 第 ${si + 1} 个分享的 hours 无法识别: ${JSON.stringify(itemHours)}，`
+          + `已回退为 ${formatHours(hours)}`);
+      }
+    }
     // 跳过空链接条目（可能是上次清理后留下的占位），并解析失败的链接，
     // 二者都不应中断整个循环
     const rawIds = Array.isArray(url) ? url : (url ? [url] : []);
