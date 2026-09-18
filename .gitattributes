@@ -1,6 +1,9 @@
-# Shell 脚本必须保持 LF。
-# 本仓库若在 Windows 上以 core.autocrlf=true 检出，脚本会被转成 CRLF，
-# 而 Docker COPY 原样保留字节，导致 shebang 变成 "#!/bin/sh\r"，
-# Alpine 下 ENTRYPOINT 直接 exec 失败（报 no such file or directory）。
+# 带 shebang 的脚本必须保持 LF。
+# 本仓库若在 Windows 上以 core.autocrlf=true 检出，脚本会被转成 CRLF：
+#  - docker-entrypoint.sh：Docker COPY 原样保留字节，shebang 变成 "#!/bin/sh\r"，
+#    Alpine 下 ENTRYPOINT 直接 exec 失败（报 no such file or directory）
+#  - scripts/*.mjs：虽然 npm script 用 `node <file>` 调用（shebang 不参与），
+#    但在 Linux 上直接 ./scripts/docker-build.mjs 执行时同样会失败
 *.sh text eol=lf
 docker-entrypoint.sh text eol=lf
+scripts/*.mjs text eol=lf
