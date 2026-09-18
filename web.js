@@ -16,6 +16,7 @@ import {
   registerScheduledTasks,
   getRunningTasks,
   isTaskRunning,
+  isValidDuration,
 } from './index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -147,13 +148,17 @@ function validateConfig(c) {
   optionalBool('runOnStartup');
   optionalBool('pruneDeadShares');
 
-  optionalInt('hours', 0);
   optionalInt('minFileSizeMB', 0);
   optionalInt('maxFilesPerShare', 0);
   optionalInt('cleanupAfterDays', 0);
   optionalInt('pollInterval', 0);
   optionalInt('webPort', 1);
   optionalInt('days', 0);
+
+  // hours 支持单位写法（1h / 1d / 1w / 1mo / 1y / 30m）或纯数字（按小时）
+  if (c.hours !== undefined && !isValidDuration(c.hours)) {
+    errors.push('hours 需要是数字（按小时）或时长写法，如 24、1h、1d、1w、1mo、1y、30m');
+  }
 
   for (const key of ['syncCron', 'alistCron']) {
     const v = c[key];
@@ -180,7 +185,11 @@ function validateConfig(c) {
         } else if (typeof u !== 'string' && !(Array.isArray(u) && u.every(x => typeof x === 'string'))) {
           errors.push(`shareUrls[${i}].url 必须是字符串或字符串数组`);
         }
-        for (const k of ['hours', 'minFileSizeMB', 'maxFilesPerShare']) {
+        // 每项的 hours 同样支持单位写法
+        if (item.hours !== undefined && !isValidDuration(item.hours)) {
+          errors.push(`shareUrls[${i}].hours 需要是数字（按小时）或时长写法，如 6、12h、1d`);
+        }
+        for (const k of ['minFileSizeMB', 'maxFilesPerShare']) {
           if (item[k] !== undefined && !isInt(item[k])) errors.push(`shareUrls[${i}].${k} 必须是整数`);
         }
         for (const k of ['password', 'tip']) {

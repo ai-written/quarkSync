@@ -1035,6 +1035,85 @@ class QuarkClient {
   }
 }
 
+// 时长单位（换算为小时）。注意 m = 分钟、mo = 月，两者含义不同：
+// 按常见时长写法惯例，m 作分钟解释，月份用 mo 以免与分钟混淆。
+const DURATION_UNITS = {
+  m: 1 / 60,      // 分钟
+  min: 1 / 60,
+  h: 1,           // 小时
+  hr: 1,
+  d: 1 * 24,      // 天
+  w: 7 * 24,      // 周
+  mo: 30 * 24,    // 月（按 30 天计）
+  y: 365 * 24,    // 年（按 365 天计）
+};
+
+// 校验时长写法是否合法（供配置校验使用，与 parseDurationHours 保持同一套规则）
+export function isValidDuration(value) {
+  if (typeof value === 'number') return Number.isFinite(value) && value >= 0;
+  if (typeof value !== 'string') return false;
+  const s = value.trim().toLowerCase();
+  if (s === '') return false;
+  if (/^\d+(\.\d+)?$/.test(s)) return Number(s) >= 0;
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*(mo|min|m|h|hr|d|w|y)$/);
+  if (!m) return false;
+  return Number(m[1]) >= 0;
+}
+
+// 把时间窗口写法换算为小时数。
+// 支持：纯数字（按小时，兼容旧配置）、单位写法（1h / 1d / 1w / 1mo / 1y / 30m）、
+// 以及小数（1.5d、0.5w）。无法解析时返回 fallback。
+function parseDurationHours(value, fallback = 48) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value >= 0 ? value : fallback;
+  }
+  if (typeof value !== 'string') return fallback;
+
+  const s = value.trim().toLowerCase();
+  if (s === '') return fallback;
+
+  // 纯数字：按小时（保持与旧配置兼容）
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+  }
+
+  // 数字 + 单位；单位按长度优先匹配，避免 mo 被 m 抢先
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*(mo|min|m|h|hr|d|w|y)$/);
+  if (!m) return fallback;
+  const n = Number(m[1]);
+  const unit = m[2];
+  const factor = DURATION_UNITS[unit];
+  if (!Number.isFinite(n) || n < 0 || !Number.isFinite(factor)) return fallback;
+  return n * factor;
+}
+
+// 人类可读的时长描述，用于日志（把小时数还原成易读形式）
+function formatHours(hours) {
+  if (!Number.isFinite(hours)) return String(hours);
+  if (hours === 0) return '0 小时';
+  if (hours % (365 * 24) === 0) return `${hours / (365 * 24)} 年`;
+  if (hours % (30 * 24) === 0) return `${hours / (30 * 24)} 个月`;
+  if (hours % (7 * 24) === 0) return `${hours / (7 * 24)} 周`;
+  if (hours % 24 === 0) return `${hours / 24} 天`;
+  if (hours < 1) return `${Math.round(hours * 60)} 分钟`;
+  return `${Number(hours.toFixed(2))} 小时`;
+}
+
+// 解决全局时间窗口：hours 优先，其次历史字段 days（按天），否则默认 48 小时。
+// hours 支持单位写法；days 是旧配置里的纯数值（单位: 天），单独按其原语义换算。
+function resolveWindowHours(config) {
+  if (config.hours !== undefined && config.hours !== null && config.hours !== '') {
+    return parseDurationHours(config.hours, 48);
+  }
+  if (config.days !== undefined && config.days !== null && config.days !== '') {
+    const n = Number(config.days);
+    if (Number.isFinite(n) && n >= 0) return n * 24;
+  }
+  return 48;
+}
+
 function filterByHours(files, hours) {
   const cutoff = Date.now() - hours * 60 * 60 * 1000;
   return files.filter(f => {
@@ -1056,7 +1135,9 @@ async function syncInternal(config) {
     throw new Error('请在 config.json 中填写 shareUrl 或 shareUrls');
   }
 
-  const hours = config.hours ?? (config.days ? config.days * 24 : 48);
+  // 时间窗口支持 1h / 1d / 1w / 1mo / 1y / 30m 等单位写法（纯数字按小时，兼容旧配置）。
+  // days 为历史字段（数值按天计），仅在没有 hours 时生效。
+  const hours = resolveWindowHours(config);
   const pollInterval = config.pollInterval || 1000;
 
   const client = new QuarkClient(config.cookie);
@@ -1081,7 +1162,10 @@ async function syncInternal(config) {
   for (let si = 0; si < shareUrls.length; si++) {
     const { url, password, tip, hours: itemHours, minFileSizeMB: itemMinSizeMB, maxFilesPerShare: itemMaxFiles } = shareUrls[si];
     const shareTip = tip || config.tip;
-    const shareHours = itemHours ?? hours;
+    // 每项分享也可单独覆盖时间窗口，同样支持单位写法
+    const shareHours = itemHours !== undefined && itemHours !== null && itemHours !== ''
+      ? parseDurationHours(itemHours, hours)
+      : hours;
     // 跳过空链接条目（可能是上次清理后留下的占位），并解析失败的链接，
     // 二者都不应中断整个循环
     const rawIds = Array.isArray(url) ? url : (url ? [url] : []);
@@ -1106,7 +1190,7 @@ async function syncInternal(config) {
     } else {
       log(`分享 ID: ${pwdIds.join(', ')}${shareTip ? `  (前缀: ${shareTip})` : ''}`);
     }
-    log(`时间范围: 最近 ${shareHours} 小时更新\n`);
+    log(`时间范围: 最近 ${formatHours(shareHours)}更新\n`);
 
     try {
       log('2. 获取分享 token...');
@@ -1140,7 +1224,7 @@ async function syncInternal(config) {
         largeFiles = [...largeFiles].sort(sortByEpisode).slice(0, maxPerShare);
         capped = true;
       }
-      log(`   最近 ${shareHours} 小时更新的文件: ${recentFiles.length} 个` +
+      log(`   最近 ${formatHours(shareHours)}更新的文件: ${recentFiles.length} 个` +
         (capped ? ` → 限制取最新 ${maxPerShare} 个` : '') + '\n');
 
       if (largeFiles.length === 0) {

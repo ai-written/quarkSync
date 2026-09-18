@@ -223,10 +223,10 @@
           <div class="subcard">
             <h3>筛选与转存</h3>
             <div class="grid">
-              <label>时间窗口 hours</label>
+              <label>时间窗口</label>
               <div>
-                <input type="number" id="hours" min="0">
-                <div class="hint">只转存该小时数内更新的文件。注意填 0 会转存不了任何文件。</div>
+                <input type="text" id="hours" placeholder="24 或 1d">
+                <div class="hint">支持单位：<code>30m</code> 分钟、<code>12h</code> 小时、<code>1d</code> 天、<code>1w</code> 周、<code>1mo</code> 月（30 天）、<code>1y</code> 年；也可直接填数字（按小时）。注意 0 会转存不了任何文件。</div>
               </div>
               <label>最小文件大小 MB</label>
               <div>
@@ -517,7 +517,7 @@ function renderShares(list) {
       <td><textarea rows="${urlIsArr ? 3 : 1}" data-f="url"
             placeholder="https://pan.quark.cn/s/xxxxxx&#10;（换行填写多个即为备用链接组）">${esc(urlText)}</textarea></td>
       <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="继承"></td>
-      <td><input type="number" min="0" data-f="hours" value="${esc(obj.hours)}" placeholder="继承"></td>
+      <td><input type="text" min="0" data-f="hours" value="${esc(obj.hours)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="minFileSizeMB" value="${esc(obj.minFileSizeMB)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="maxFilesPerShare" value="${esc(obj.maxFilesPerShare)}" placeholder="继承"></td>
       <td class="col-act"><button class="danger" data-act="del">删除</button></td>
@@ -584,7 +584,12 @@ function collectShares() {
     if (asArr ? lines.length > 0 : url !== '') o.url = url;
     const pw = g('password'); if (pw !== undefined) o.password = pw;
     const tip = g('tip'); if (tip !== undefined) o.tip = tip;
-    for (const k of ['hours', 'minFileSizeMB', 'maxFilesPerShare']) {
+    // hours 支持单位写法，按字符串处理；纯数字存为数字以兼容旧配置
+    const hv = g('hours');
+    if (hv !== undefined) {
+      o.hours = /^\d+(\.\d+)?$/.test(hv) ? Number(hv) : hv.toLowerCase().replace(/\s+/g, '');
+    }
+    for (const k of ['minFileSizeMB', 'maxFilesPerShare']) {
       const v = g(k);
       if (v !== undefined) o[k] = Number(v);
     }
@@ -667,12 +672,20 @@ $('saveBtn').onclick = async () => {
   setStr('alistToken', 'alistToken');
 
   const setNum = (k, el) => { const v = numOrUndef($(el).value); if (v === undefined) delete out[k]; else out[k] = v; };
-  setNum('hours', 'hours');
   setNum('minFileSizeMB', 'minFileSizeMB');
   setNum('maxFilesPerShare', 'maxFilesPerShare');
   setNum('pollInterval', 'pollInterval');
   setNum('cleanupAfterDays', 'cleanupAfterDays');
   setNum('webPort', 'webPort');
+
+  // hours 支持单位写法（1d/1w/1mo/1y/30m），因此按字符串处理：
+  // 纯数字仍存为数字（兼容旧配置与后端），含单位则原样保存
+  {
+    const raw = $('hours').value.trim();
+    if (raw === '') delete out.hours;
+    else if (/^\d+(\.\d+)?$/.test(raw)) out.hours = Number(raw);
+    else out.hours = raw.toLowerCase().replace(/\s+/g, '');
+  }
 
   out.deleteAfterDownload = $('deleteAfterDownload').checked;
   out.alistRefresh = $('alistRefresh').checked;
