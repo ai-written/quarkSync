@@ -1,6 +1,6 @@
 {
   "name": "quark-sync",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "自动从夸克网盘分享链接中提取最近两天更新的文件并转存到自己的网盘",
   "main": "index.js",
   "type": "module",
