@@ -168,8 +168,8 @@ function writeLog(level, message) {
   } catch {}
 }
 
-export function readLogs({ maxLines = 200, level = '', keyword = '' } = {}) {
-  const want = Math.max(1, Math.min(5000, Number(maxLines) || 200));
+export function readLogs({ maxLines = 500, level = '', keyword = '' } = {}) {
+  const want = Math.max(1, Math.min(5000, Number(maxLines) || 500));
   if (!fs.existsSync(LOG_FILE)) return { lines: [], truncated: false };
 
   const needle = String(keyword || '').toLowerCase();

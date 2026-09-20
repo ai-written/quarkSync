@@ -349,7 +349,7 @@
             <option value="ERROR">ERROR</option>
           </select>
           <input type="text" id="logKeyword" placeholder="关键字过滤">
-          <input type="number" id="logLines" value="200" min="1" max="5000" style="width:90px">
+          <input type="number" id="logLines" value="500" min="1" max="5000" style="width:90px">
           <button id="logRefresh" class="primary">刷新</button>
           <label class="hint"><input type="checkbox" id="logAuto"> 自动刷新(5s)</label>
         </div>
@@ -753,7 +753,7 @@ $('saveBtn').onclick = async () => {
 let logTimer = null;
 async function loadLogs() {
   const q = new URLSearchParams({
-    lines: $('logLines').value || '200',
+    lines: $('logLines').value || '500',
     level: $('logLevel').value,
     keyword: $('logKeyword').value.trim(),
   });

@@ -419,7 +419,7 @@ function createServer() {
 
       if (p === '/api/logs' && req.method === 'GET') {
         const result = readLogs({
-          maxLines: url.searchParams.get('lines') || 200,
+          maxLines: url.searchParams.get('lines') || 500,
           level: url.searchParams.get('level') || '',
           keyword: url.searchParams.get('keyword') || '',
         });
