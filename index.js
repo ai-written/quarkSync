@@ -1464,6 +1464,35 @@ export async function runSync(config) {
   return withTaskLock('sync', () => syncInternal(config ?? loadConfig()));
 }
 
+// 同步 + AList 下载串联执行（供 downloadAfterSync 开启时的定时任务使用）。
+//
+// 为什么不沿用「syncCron 11:00 / alistCron 11:05」这种错开写法：
+// sync 与 alist 用的是两把不同的任务锁，二者可以并发，错开几分钟只是靠猜
+// 「同步要跑多久」——同步一旦超过这个间隔，AList 就会在同步还没结束时去列目录，
+// 可能漏文件或拿到还没转存完的内容。串联执行是等同步真正跑完再开始下载，
+// 不依赖任何时间猜测。
+//
+// 整个过程同时持有 sync 与 alist 两把锁，因此期间定时的独立 alist 任务、
+// 或网页手动触发都不会插进来并发执行。
+export async function runSyncThenDownload(config) {
+  const cfg = config ?? loadConfig();
+  return withTaskLock('sync', () => withTaskLock('alist', async () => {
+    const syncResult = await syncInternal(cfg);
+
+    if (!cfg.alistUrl) {
+      logError('   ⚠ 已开启 downloadAfterSync 但未配置 alistUrl，跳过同步后的下载');
+      return syncResult;
+    }
+    try {
+      await alistInternal(cfg);
+    } catch (e) {
+      // 同步本身已经成功，下载失败不应让整个同步任务算作失败
+      logError(`   ✗ 同步后的 AList 下载失败: ${e.message}`);
+    }
+    return syncResult;
+  }));
+}
+
 async function downloadMode(forceDownload = false) {
   const config = loadConfig();
   const client = new QuarkClient(config.cookie);
@@ -1754,8 +1783,17 @@ export function registerScheduledTasks({ quiet = false } = {}) {
   const alistCrons = [].concat(config.alistCron || []).filter(Boolean);
   const errors = [];
 
+  // downloadAfterSync：同步任务跑完接着做 AList 下载。
+  // 任务 key 仍为 sync:N（保持网页手动触发与其它逻辑兼容），只改名称与执行体。
+  const chained = config.downloadAfterSync === true;
+
   const specs = [
-    ...syncCrons.map((c, i) => ({ key: `sync:${i}`, name: '同步模式', cron: c, fn: () => runSync(loadConfig()) })),
+    ...syncCrons.map((c, i) => ({
+      key: `sync:${i}`,
+      name: chained ? '同步 + AList下载' : '同步模式',
+      cron: c,
+      fn: () => (chained ? runSyncThenDownload(loadConfig()) : runSync(loadConfig())),
+    })),
     ...alistCrons.map((c, i) => ({ key: `alist:${i}`, name: 'AList下载', cron: c, fn: () => runAlist(loadConfig()) })),
   ];
 

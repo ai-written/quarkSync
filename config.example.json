@@ -18,6 +18,7 @@
   "alistRefresh": false,
   "syncCron": ["0 11 * * *", "0 20 * * *"],
   "alistCron": "0 3 * * *",
+  "downloadAfterSync": false,
   "tip": "",
   "hours": 24,
   "minFileSizeMB": 0,

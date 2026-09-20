@@ -54,7 +54,8 @@ cp config.example.json config.json
 | `alistRefresh` | bool | 否 | AList 列出文件时是否绕过缓存（需管理员权限），默认 false |
 | `alistToken` | string | 否 | AList 认证 Token |
 | `syncCron` | string/array | 否 | 同步任务的 cron 表达式，支持数组 |
-| `alistCron` | string/array | 否 | AList 下载任务的 cron 表达式，支持数组 |
+| `alistCron` | string/array | 否 | AList 下载任务的 cron 表达式，支持数组。开启 `downloadAfterSync` 后通常可留空 |
+| `downloadAfterSync` | bool | 否 | 同步任务跑完接着执行 AList 下载（仅定时任务），默认 false |
 | `pollInterval` | int | 否 | 任务轮询间隔（毫秒） |
 | `pruneDeadShares` | bool | 否 | 任务执行后自动从配置中移除**确定失效**的分享链接，默认 false（仅报告）。临时网络故障、限流、提取码错误都不会误删 |
 | `webPort` | int | 否 | 网页管理界面监听端口，默认 3000 |
@@ -205,7 +206,7 @@ Cron 配置示例：
 ```json
 {
   "syncCron": "0 20 * * *",
-  "alistCron": ["5 20 * * *"],
+  "downloadAfterSync": true,
   "cleanupAfterDays": 14
 }
 ```
@@ -219,6 +220,30 @@ Cron 配置示例：
   "cleanupAfterDays": 14
 }
 ```
+
+#### 同步后自动下载（`downloadAfterSync`）
+
+若每次同步完都会接着下载，不必用 `alistCron` 去错开时间，开启这个开关即可：
+
+```json
+{
+  "syncCron": ["0 11 * * *", "0 20 * * *"],
+  "downloadAfterSync": true
+}
+```
+
+同步任务跑完会**紧接着**执行 AList 下载，因此：
+
+- **不需要再猜间隔**。`syncCron` 与 `alistCron` 用的是两把不同的任务锁，**可以并发**，
+  所以「同步 11:00 / 下载 11:05」这种写法是靠猜同步要跑多久 —— 同步一旦超过这个间隔，
+  下载就会在同步还没结束时去列目录，可能漏文件或拿到还没转存完的内容。
+  串联执行是等同步真正跑完再开始，不依赖任何时间猜测。
+- 整个串联过程同时持有同步与下载两把锁，期间定时的独立下载任务或网页手动触发都不会插进来。
+- 只影响**定时任务**；网页「任务」页手动点的「同步模式」与「AList下载」仍各自独立执行。
+- 开启后建议把 `alistCron` 留空；如需额外增加一次独立下载，仍可继续配置它。
+- 任务名会显示为「同步 + AList下载」，「任务」页可看到它的下次运行时间。
+- 未配置 `alistUrl` 时会记录一条告警并跳过下载（同步结果不受影响）；
+  下载失败也只记录错误，不会让已经成功的同步算作失败。
 
 ### 网页管理界面（推荐）
 

@@ -304,10 +304,18 @@
                 <input type="text" id="syncCron" placeholder="0 11 * * *">
                 <div class="hint">多个用英文逗号分隔，例如：0 11 * * *, 0 20 * * *</div>
               </div>
+              <label>同步后自动下载</label>
+              <div>
+                <label class="hint" style="display:flex;align-items:center;gap:6px">
+                  <input type="checkbox" id="downloadAfterSync" style="width:auto;margin:0">
+                  同步任务跑完接着执行 AList 下载
+                </label>
+                <div class="hint">开启后「同步 cron」到点会先同步、跑完再下载，<b>不再需要</b>用 AList cron 去错开时间；只影响定时任务，网页手动点的两个按钮仍各自独立。</div>
+              </div>
               <label>AList cron</label>
               <div>
-                <input type="text" id="alistCron" placeholder="0 3 * * *">
-                <div class="hint">多个用英文逗号分隔。</div>
+                <input type="text" id="alistCron" placeholder="留空即可">
+                <div class="hint">多个用英文逗号分隔。开启上面的「同步后自动下载」后，这里通常可以留空。</div>
               </div>
             </div>
           </div>
@@ -653,6 +661,7 @@ async function loadConfig() {
   // 未设置时默认启用（与后端 config.runOnStartup !== false 一致）
   $('runOnStartup').checked = c.runOnStartup !== false;
   $('pruneDeadShares').checked = c.pruneDeadShares === true;
+  $('downloadAfterSync').checked = c.downloadAfterSync === true;
 
   const su = c.shareUrls ?? (c.shareUrl ? [c.shareUrl] : []);
   renderShares(su);
@@ -704,6 +713,7 @@ $('saveBtn').onclick = async () => {
   out.alistRefresh = $('alistRefresh').checked;
   out.runOnStartup = $('runOnStartup').checked;
   out.pruneDeadShares = $('pruneDeadShares').checked;
+  out.downloadAfterSync = $('downloadAfterSync').checked;
   out.webHost = $('webHost').value;
 
   const sc = inputToCron($('syncCron').value);

@@ -147,6 +147,7 @@ function validateConfig(c) {
   optionalBool('alistRefresh');
   optionalBool('runOnStartup');
   optionalBool('pruneDeadShares');
+  optionalBool('downloadAfterSync');
 
   optionalInt('minFileSizeMB', 0);
   optionalInt('maxFilesPerShare', 0);
