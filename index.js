@@ -1299,26 +1299,35 @@ async function syncInternal(config) {
       const filesOnly = allFiles.filter(f => !f.dir);
       log(`   其中文件: ${filesOnly.length} 个`);
 
+      // 日志顺序必须与处理顺序一致：先时间窗口、再体积过滤。
+      // 若反过来，会出现「其中文件 12 个」紧跟「过滤 <100MB: 剩余 0 个」，
+      // 让人误以为是体积过滤把文件全拦掉了，实际是时间窗口内本就没有文件。
       const recentFiles = filterByHours(allFiles, shareHours);
+      log(`   时间窗口内 (最近 ${formatHours(shareHours)}): ${recentFiles.length} 个`);
+
       const minSizeMB = itemMinSizeMB ?? config.minFileSizeMB ?? 0;
-      let largeFiles = minSizeMB > 0
-        ? recentFiles.filter(f => (f.size || 0) >= minSizeMB * 1048576)
-        : recentFiles;
+      let largeFiles = recentFiles;
       if (minSizeMB > 0) {
-        log(`   过滤 <${minSizeMB}MB 文件: 剩余 ${largeFiles.length} 个\n`);
+        // size 缺失或为 0 的文件会被判为过小而被排除，单独统计以便察觉接口未返回 size
+        const unknownSize = recentFiles.filter(f => !f.size).length;
+        largeFiles = recentFiles.filter(f => (f.size || 0) >= minSizeMB * 1048576);
+        log(`   过滤 <${minSizeMB}MB 后剩余: ${largeFiles.length} 个`
+          + (unknownSize > 0 ? `（其中 ${unknownSize} 个大小未知，已按 0 排除）` : ''));
       }
 
       const maxPerShare = itemMaxFiles ?? config.maxFilesPerShare ?? 0;
-      let capped = false;
       if (maxPerShare > 0 && largeFiles.length > maxPerShare) {
         largeFiles = [...largeFiles].sort(sortByEpisode).slice(0, maxPerShare);
-        capped = true;
+        log(`   限制每分享最多 ${maxPerShare} 个（按集数取最新）`);
       }
-      log(`   最近 ${formatHours(shareHours)}更新的文件: ${recentFiles.length} 个` +
-        (capped ? ` → 限制取最新 ${maxPerShare} 个` : '') + '\n');
+      log(`   → 候选文件: ${largeFiles.length} 个\n`);
 
       if (largeFiles.length === 0) {
-        log('没有找到符合条件的文件，无需转存。');
+        // 指明是哪一步筛空的，避免只看到"没有符合条件"却不知原因
+        const why = recentFiles.length === 0
+          ? `该分享内没有最近 ${formatHours(shareHours)}内更新的文件`
+          : `时间窗口内的 ${recentFiles.length} 个文件都小于 ${minSizeMB}MB`;
+        log(`没有找到符合条件的文件（${why}），无需转存。`);
         continue;
       }
 
@@ -1432,11 +1441,12 @@ async function syncInternal(config) {
 
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
-    await client.cleanupOldFiles(targetDirFid, config.cleanupAfterDays);
+    const cloudResult = await client.cleanupOldFiles(targetDirFid, config.cleanupAfterDays);
     const localResult = cleanupLocalFiles(path.resolve(config.downloadDir || '.'), config.cleanupAfterDays);
-    if (localResult.deleted > 0) {
-      log(`   ✓ 本地清理完成: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
-    }
+    // 无论有没有删除都要给出结论：否则只剩一行标题，
+    // 无法区分「跑过了但没东西可删」和「中途失败/被跳过」
+    if (cloudResult.deleted === 0) log('   网盘: 没有超过保留期的文件');
+    log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
   }
 
   return { totalSuccess, totalFailed, allSuccess, allFailed, deadPwdIds: [...deadPwdIds], prunedUrls };
@@ -1480,7 +1490,8 @@ async function downloadMode(forceDownload = false) {
 
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
-    cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+    const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+    log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
   }
 }
 
@@ -1680,7 +1691,8 @@ async function alistMode(forceDownload = false) {
 
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
-    cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+    const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+    log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
   }
 }
 
@@ -1804,9 +1816,7 @@ async function alistInternal(config) {
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`   执行本地清理 (${config.cleanupAfterDays}天前的文件)...`);
     const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays);
-    if (localResult.deleted > 0) {
-      log(`   ✓ 本地清理完成: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
-    }
+    log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
   }
 }
 
