@@ -1127,6 +1127,83 @@ function filterByHours(files, hours) {
   });
 }
 
+// 在扩展名前插入 " (n)"：a.mp4 -> a (2).mp4；无扩展名（含 .gitignore 这类）则直接追加
+function withNumericSuffix(name, n) {
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return `${name} (${n})`;
+  return `${name.slice(0, dot)} (${n})${name.slice(dot)}`;
+}
+
+// 给刚转存的文件加上文件名前缀，返回实际使用的文件名数组（顺序与 names 一致）。
+//
+// 关于重名：若「前缀 + 原名」已被占用，不能简单跳过——那会留下一个没有前缀的
+// 文件，既破坏前缀约定，用户也难以分辨哪份是本次转存的。能走到这一步说明转存前
+// 的去重（按「名称|大小」比对）没有命中，即已有的那个是同名但大小不同的另一份
+// 内容，不能丢弃。因此改为换用唯一名称（" (2)"、" (3)" …），既保住前缀又保留两份。
+async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {}) {
+  const out = [...names];
+  if (!shareTip || names.length === 0) return out;
+
+  const settleMs = opts.settleMs ?? 2000;
+  const retryMs = opts.retryMs ?? 1000;
+  const maxSuffix = opts.maxSuffix ?? 99;
+
+  log('\n   等待文件处理完成...');
+  await new Promise(r => setTimeout(r, settleMs));
+
+  log('   添加文件名前缀...');
+  const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
+
+  let existingFiles = await client.listAllUserFiles(targetDirFid);
+  const taken = new Set(existingFiles.map(f => f.file_name));
+  let renamed = 0;
+  let collided = 0;
+
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    const wanted = `${prefix}${name}`;
+
+    // 目标名被占用时挑一个未被占用的序号名
+    let target = wanted;
+    if (taken.has(target)) {
+      let n = 2;
+      while (n <= maxSuffix && taken.has(withNumericSuffix(wanted, n))) n++;
+      target = withNumericSuffix(wanted, n);
+    }
+
+    let match = existingFiles.find(f => f.file_name === name);
+    if (!match) {
+      log(`   重试查找 ${name}...`);
+      await new Promise(r => setTimeout(r, retryMs));
+      existingFiles = await client.listAllUserFiles(targetDirFid);
+      for (const f of existingFiles) taken.add(f.file_name);
+      match = existingFiles.find(f => f.file_name === name);
+    }
+    if (!match) {
+      log(`   ✗ ${name} 仍未找到，跳过重命名`);
+      continue;
+    }
+    try {
+      await client.renameFile(match.fid, target);
+      renamed++;
+      taken.add(target);
+      out[i] = target;
+      if (target === wanted) {
+        log(`   ✓ ${name} → ${target}`);
+      } else {
+        collided++;
+        log(`   ✓ ${name} → ${target}（${wanted} 已存在，加序号避免覆盖）`);
+      }
+    } catch (e) {
+      log(`   ✗ ${name} 重命名失败: ${e.message}`);
+    }
+  }
+
+  if (renamed > 0) log(`   已重命名 ${renamed} 个文件\n`);
+  if (collided > 0) log(`   提示: 其中 ${collided} 个因重名改用带序号的文件名，两份都已保留\n`);
+  return out;
+}
+
 // 统一同步实现：CLI(sync 模式) 与 cron/网页触发共用同一份逻辑
 async function syncInternal(config) {
   if (!config.cookie || config.cookie === '从浏览器复制的完整 Cookie 字符串') {
@@ -1291,51 +1368,7 @@ async function syncInternal(config) {
         for (const name of results.success) log(`  ✓ ${name}`);
       }
 
-      let renamedNames = results.success;
-      if (shareTip && results.success.length > 0) {
-        renamedNames = [];
-        log('\n   等待文件处理完成...');
-        await new Promise(r => setTimeout(r, 2000));
-
-        log('   添加文件名前缀...');
-        const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
-
-        let existingFiles = await client.listAllUserFiles(targetDirFid);
-        let existingNames = new Set(existingFiles.map(f => f.file_name));
-        let renamed = 0;
-
-        for (const name of results.success) {
-          const newName = `${prefix}${name}`;
-          if (existingNames.has(newName)) {
-            log(`   ⏭ ${name} (${newName} 已存在)`);
-            renamedNames.push(newName);
-            continue;
-          }
-          let match = existingFiles.find(f => f.file_name === name);
-          if (!match) {
-            log(`   重试查找 ${name}...`);
-            await new Promise(r => setTimeout(r, 1000));
-            existingFiles = await client.listAllUserFiles(targetDirFid);
-            existingNames = new Set(existingFiles.map(f => f.file_name));
-            match = existingFiles.find(f => f.file_name === name);
-          }
-          if (!match) {
-            log(`   ✗ ${name} 仍未找到，跳过重命名`);
-            renamedNames.push(name);
-            continue;
-          }
-          try {
-            await client.renameFile(match.fid, newName);
-            renamed++;
-            log(`   ✓ ${name} → ${newName}`);
-            renamedNames.push(newName);
-          } catch (e) {
-            log(`   ✗ ${name} 重命名失败: ${e.message}`);
-            renamedNames.push(name);
-          }
-        }
-        if (renamed > 0) log(`   已重命名 ${renamed} 个文件\n`);
-      }
+      const renamedNames = await applyNamePrefix(client, targetDirFid, results.success, shareTip);
 
       totalSuccess += results.success.length;
       totalFailed += results.failed.length;
