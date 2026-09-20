@@ -1146,7 +1146,7 @@ async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {})
 
   const settleMs = opts.settleMs ?? 2000;
   const retryMs = opts.retryMs ?? 1000;
-  const maxSuffix = opts.maxSuffix ?? 99;
+  const maxSuffix = opts.maxSuffix ?? 999;
 
   log('\n   等待文件处理完成...');
   await new Promise(r => setTimeout(r, settleMs));
@@ -1161,14 +1161,30 @@ async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {})
 
   for (let i = 0; i < names.length; i++) {
     const name = names[i];
+
+    // 分享里的文件可能本身就带这个前缀（例如 tip 与剧集名相同），
+    // 此时不再叠加，否则会得到「遮天-遮天-01.mp4」这种名字
+    if (name.startsWith(prefix)) {
+      log(`   ⏭ ${name}（已带前缀，跳过）`);
+      continue;
+    }
+
     const wanted = `${prefix}${name}`;
 
-    // 目标名被占用时挑一个未被占用的序号名
+    // 目标名被占用时挑一个未被占用的序号名。
+    // 若可用序号全部用尽则放弃本次重命名 —— 宁可不加前缀，
+    // 也绝不能改名到一个已存在的文件上（可能覆盖别人的文件）。
     let target = wanted;
     if (taken.has(target)) {
-      let n = 2;
-      while (n <= maxSuffix && taken.has(withNumericSuffix(wanted, n))) n++;
-      target = withNumericSuffix(wanted, n);
+      target = '';
+      for (let n = 2; n <= maxSuffix; n++) {
+        const cand = withNumericSuffix(wanted, n);
+        if (!taken.has(cand)) { target = cand; break; }
+      }
+      if (!target) {
+        log(`   ✗ ${wanted} 已被占用，且 2..${maxSuffix} 的序号名也都已被占用，跳过重命名`);
+        continue;
+      }
     }
 
     let match = existingFiles.find(f => f.file_name === name);
@@ -1844,6 +1860,11 @@ export async function runAlist(config) {
 
 async function alistInternal(config) {
   const alistUrl = config.alistUrl;
+  // alistMode(CLI) 自带校验，这里补上是为了让 cron、网页手动触发、启动补跑
+  // 也都拿到可读提示，而不是 AlistClient 里 undefined.replace 的报错
+  if (!alistUrl) {
+    throw new Error('未配置 alistUrl，无法执行 AList 下载（请在配置页填写 AList 服务器地址）');
+  }
   const alistPath = config.alistPath || '/kuake/来自：分享';
   const saveDir = path.resolve(config.downloadDir || '.');
   if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
