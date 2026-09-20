@@ -15,6 +15,7 @@ function now() {
 
 const LOG_RETENTION_DAYS = 7;
 const LOG_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const DOWNLOAD_TIMEOUT_MS = 10800000;
 let lastLogCleanupAt = 0;
 
 // 日志时间戳为 Asia/Shanghai 显示值，按该时区（无夏令时）还原为 UTC 毫秒
@@ -598,6 +599,109 @@ function ts13() {
   return String(Date.now());
 }
 
+// 下载单个文件并校验完整性，返回实际写入的字节数。
+//
+// 为什么不能只用 writer 的 'finish' 判定成功：
+// 'finish' 只表示写入端已关闭，**上游提前结束也会触发它**。尤其当服务端用
+// chunked（不带 Content-Length）时，连接中途断开在客户端看来就是"正常结束"，
+// 于是截断的文件被当成成功，接着被记入 .downloaded.json，下次运行直接跳过，
+// 永远不会重下——表现为「网盘里 3G，本地只有 300M」且不再自愈。
+//
+// 因此这里三重校验：响应是否完整收完、Content-Length 是否吻合、
+// 以及列表里声明的文件大小是否吻合。任一不符即删除半成品并抛错，
+// 让调用方不计入"已下载"，下次运行自动重试。
+//
+// 另外写入 .part 临时文件、校验通过后再改名，避免半成品冒充成品，
+// 也避免重新下载失败时把上一次的好文件毁掉。
+async function downloadToFile({ url, headers = {}, savePath, expectedSize = 0, label = '' }) {
+  const partPath = `${savePath}.part`;
+  const name = label || path.basename(savePath);
+  const drop = () => { try { fs.rmSync(partPath, { force: true }); } catch {} };
+
+  let resp;
+  try {
+    resp = await axios.get(url, {
+      headers,
+      responseType: 'stream',
+      timeout: DOWNLOAD_TIMEOUT_MS,
+      validateStatus: () => true,
+    });
+  } catch (e) {
+    throw new Error(`请求失败: ${e.message}`);
+  }
+  if (resp.status >= 400) throw new Error(`HTTP ${resp.status}`);
+
+  const declared = parseInt(resp.headers['content-length'] || '0', 10) || 0;
+  // 有 Content-Length 用它算进度；没有（chunked）就用列表里的大小，至少能显示百分比
+  const totalForPct = declared > 0 ? declared : (expectedSize > 0 ? expectedSize : 0);
+  const stream = resp.data;
+  let received = 0;
+  const startTime = Date.now();
+
+  const timer = setInterval(() => {
+    const mb = (received / 1048576).toFixed(1);
+    const speed = (received / 1048576 / Math.max((Date.now() - startTime) / 1000, 0.001)).toFixed(1);
+    const pct = totalForPct > 0 ? `${Math.round(received / totalForPct * 100)}% ` : '';
+    process.stdout.write(`\r   ${name}: ${pct}(${mb} MB, ${speed} MB/s)`);
+  }, 1000);
+
+  const writer = fs.createWriteStream(partPath);
+  try {
+    await new Promise((resolve, reject) => {
+      stream.on('data', c => { received += c.length; });
+      stream.on('error', reject);
+      writer.on('error', reject);
+      writer.on('finish', resolve);
+      stream.pipe(writer);
+    });
+  } catch (e) {
+    clearInterval(timer);
+    process.stdout.write('\n');
+    try { writer.destroy(); } catch {}
+    drop();
+    throw new Error(`传输中断: ${e.message}`);
+  }
+  clearInterval(timer);
+  process.stdout.write('\n');
+
+  // 完整性校验：任一不符都视为失败，删掉半成品让下次重下
+  const complete = typeof stream.complete === 'boolean' ? stream.complete : true;
+  const fail = msg => { drop(); throw new Error(msg); };
+
+  if (!complete) {
+    fail(`连接被提前中断（只收到 ${received} 字节）`);
+  }
+  if (declared > 0 && received !== declared) {
+    fail(`字节数不符：收到 ${received}，响应声明 ${declared}`);
+  }
+  if (expectedSize > 0 && received !== expectedSize) {
+    fail(`大小不符：收到 ${received}，列表声明 ${expectedSize}`);
+  }
+  if (received === 0) {
+    fail('收到 0 字节');
+  }
+
+  fs.renameSync(partPath, savePath);
+  return received;
+}
+
+// 判断本地是否已有一份完整的副本（用于决定能否跳过下载）。
+//
+// 仅凭 .downloaded.json 里的记录判断是不够的：记录只说明"曾经下过"，
+// 无法证明磁盘上那份是完整的。此前下载被截断却误报成功时，记录已经写下，
+// 于是半成品会被永久跳过、永不自愈。这里按列表声明的大小再核对一次，
+// 缺失或大小不符都视为需要重新下载。
+function localCopyIsComplete(saveDir, name, expectedSize) {
+  try {
+    const st = fs.statSync(path.join(saveDir, name));
+    if (!st.isFile()) return false;
+    if (expectedSize > 0 && st.size !== expectedSize) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 class QuarkClient {
   constructor(cookie) {
     this.base = 'https://drive-pc.quark.cn';
@@ -770,38 +874,13 @@ class QuarkClient {
     throw new Error('获取下载地址失败: 所有 UA 均被限制');
   }
 
-  async downloadFile(downloadUrl, savePath) {
-    return new Promise((resolve, reject) => {
-      const writer = fs.createWriteStream(savePath);
-      axios.get(downloadUrl, {
-        headers: { 'User-Agent': UA_CLIENT, 'Cookie': this.cookie, 'Referer': 'https://pan.quark.cn/' },
-        responseType: 'stream',
-        timeout: 10800000,
-        validateStatus: () => true,
-      }).then(resp => {
-        if (resp.status >= 400) {
-          writer.close();
-          fs.unlinkSync(savePath);
-          reject(new Error(`HTTP ${resp.status}`));
-          return;
-        }
-        const total = parseInt(resp.headers['content-length'] || '0', 10);
-        let downloaded = 0;
-        const name = path.basename(savePath);
-        resp.data.on('data', chunk => {
-          downloaded += chunk.length;
-        });
-        const timer = setInterval(() => {
-          if (total > 0) {
-            const pct = Math.round(downloaded / total * 100);
-            const mb = (downloaded / 1048576).toFixed(1);
-            process.stdout.write(`\r   ${name}: ${pct}% (${mb} MB)`);
-          }
-        }, 1000);
-        resp.data.pipe(writer);
-        writer.on('finish', () => { clearInterval(timer); process.stdout.write('\n'); resolve(); });
-        writer.on('error', e => { clearInterval(timer); reject(e); });
-      }).catch(reject);
+  async downloadFile(downloadUrl, savePath, expectedSize = 0) {
+    return downloadToFile({
+      url: downloadUrl,
+      headers: { 'User-Agent': UA_CLIENT, 'Cookie': this.cookie, 'Referer': 'https://pan.quark.cn/' },
+      savePath,
+      expectedSize,
+      label: path.basename(savePath),
     });
   }
 
@@ -821,7 +900,8 @@ class QuarkClient {
         const item = queue.shift();
         const savePath = path.join(saveDir, item.file_name);
         try {
-          await this.downloadFile(item.download_url, savePath);
+          // 传入列表里声明的文件大小，下载后据此校验是否被截断
+          await this.downloadFile(item.download_url, savePath, item.size || 0);
           success.push({ fid: item.fid, file_name: item.file_name, size: item.size });
         } catch (e) {
           log(`   ✗ ${item.file_name} 下载失败: ${e.message}`);
@@ -874,9 +954,19 @@ class QuarkClient {
     }
 
     const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
+    let incomplete = 0;
     const toDownload = skipExisting
-      ? files.filter(f => !downloadedRecord.has(getDedupKey(f)))
+      ? files.filter(f => {
+        if (!downloadedRecord.has(getDedupKey(f))) return true;
+        // 有记录也要确认本地那份是完整的，否则重新下载（自愈被截断的半成品）
+        if (localCopyIsComplete(saveDir, f.file_name, f.size)) return false;
+        incomplete++;
+        return true;
+      })
       : files;
+    if (incomplete > 0) {
+      log(`   ⚠ 有 ${incomplete} 个文件本地副本缺失或大小不符，将重新下载`);
+    }
 
     if (toDownload.length === 0) {
       log(`   所有文件已下载过，无需下载。`);
@@ -1601,39 +1691,15 @@ class AlistClient {
     return files;
   }
 
-  async downloadFile(filePath, savePath) {
+  async downloadFile(filePath, savePath, expectedSize = 0) {
     const data = await this._post('fs/get', { path: filePath, password: '' });
     const downloadUrl = data.raw_url;
-    return new Promise((resolve, reject) => {
-      const writer = fs.createWriteStream(savePath);
-      axios.get(downloadUrl, {
-        responseType: 'stream',
-        timeout: 10800000,
-        validateStatus: () => true,
-      }).then(resp => {
-        if (resp.status >= 400) {
-          writer.close();
-          fs.unlinkSync(savePath);
-          reject(new Error(`HTTP ${resp.status}`));
-          return;
-        }
-        const total = parseInt(resp.headers['content-length'] || '0', 10);
-        let downloaded = 0;
-        const name = path.basename(savePath);
-        const startTime = Date.now();
-        resp.data.on('data', chunk => { downloaded += chunk.length; });
-        const timer = setInterval(() => {
-          if (total > 0) {
-            const pct = Math.round(downloaded / total * 100);
-            const mb = (downloaded / 1048576).toFixed(1);
-            const speed = (downloaded / 1048576 / ((Date.now() - startTime) / 1000)).toFixed(1);
-            process.stdout.write(`\r   ${name}: ${pct}% (${mb} MB, ${speed} MB/s)`);
-          }
-        }, 1000);
-        resp.data.pipe(writer);
-        writer.on('finish', () => { clearInterval(timer); process.stdout.write('\n'); resolve(); });
-        writer.on('error', e => { clearInterval(timer); reject(e); });
-      }).catch(reject);
+    if (!downloadUrl) throw new Error('AList 未返回下载地址 (raw_url)');
+    return downloadToFile({
+      url: downloadUrl,
+      savePath,
+      expectedSize,
+      label: path.basename(savePath),
     });
   }
 
@@ -1655,9 +1721,19 @@ class AlistClient {
     }
 
     const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
+    let incomplete = 0;
     const toDownload = skipExisting
-      ? files.filter(f => !downloadedRecord.has(getDedupKey(f)))
+      ? files.filter(f => {
+        if (!downloadedRecord.has(getDedupKey(f))) return true;
+        // 有记录也要确认本地那份是完整的，否则重新下载（自愈被截断的半成品）
+        if (localCopyIsComplete(saveDir, f.name, f.size)) return false;
+        incomplete++;
+        return true;
+      })
       : files;
+    if (incomplete > 0) {
+      log(`   ⚠ 有 ${incomplete} 个文件本地副本缺失或大小不符，将重新下载`);
+    }
 
     if (toDownload.length === 0) {
       log(`   所有文件已下载过，无需下载。`);
@@ -1677,7 +1753,8 @@ class AlistClient {
         const f = queue.shift();
         const savePath = path.join(saveDir, f.name);
         try {
-          await this.downloadFile(f.path, savePath);
+          // 传入列表里声明的文件大小，下载后据此校验是否被截断
+          await this.downloadFile(f.path, savePath, f.size || 0);
           completed++;
           successPaths.push(f.path);
           successNames.push(f.name);
