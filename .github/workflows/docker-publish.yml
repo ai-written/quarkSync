@@ -1,0 +1,91 @@
+name: Publish Docker image
+
+# 发布方式（二选一）：
+#   1. 手动：仓库 → Actions → 左侧「Publish Docker image」→ Run workflow
+#   2. 打 tag：git tag v1.6.0 && git push origin v1.6.0
+#      （tag 必须与 package.json 里的 version 一致，否则任务会失败）
+#
+# 有意不做成「push 到 main 就自动发布」：版本 tag 一旦发布就应当是不可变的，
+# 否则一次依赖升级（也会改 package.json）就可能悄悄覆盖已发布的 1.6.0 镜像。
+on:
+  workflow_dispatch:
+    inputs:
+      overwrite:
+        description: 该版本已发布过时也强制覆盖
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+# 同时只允许一个发布任务，避免两次推送互相覆盖
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本号是唯一的 tag 来源：脚本会据此同时打 latest 与 <version>
+      - name: 读取版本号
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "将发布 hsiangleev/quark-sync:latest 与 hsiangleev/quark-sync:$VERSION"
+
+      - name: 校验 tag 与版本号一致
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          if [ "v${{ steps.ver.outputs.version }}" != "${{ github.ref_name }}" ]; then
+            echo "::error::tag ${{ github.ref_name }} 与 package.json 的版本 v${{ steps.ver.outputs.version }} 不一致"
+            exit 1
+          fi
+          echo "tag ${{ github.ref_name }} 与 package.json 一致"
+
+      # arm64 在 amd64 runner 上靠 QEMU 模拟；本镜像很小，通常 1~2 分钟
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 放在登录之后，私有镜像仓库也能正确判断。
+      # 布尔输入在 inputs 上下文里是布尔值，但为稳妥两种写法都比对一次
+      - name: 检查该版本是否已发布
+        if: github.event_name == 'workflow_dispatch' && !(inputs.overwrite == true || inputs.overwrite == 'true')
+        run: |
+          set -euo pipefail
+          IMAGE="hsiangleev/quark-sync:${{ steps.ver.outputs.version }}"
+          if docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "::error::$IMAGE 已存在。若确实要覆盖，请重新运行并勾选 overwrite。"
+            exit 1
+          fi
+          echo "$IMAGE 尚未发布，继续"
+
+      # 直接复用仓库里已有的发布脚本，保证 CI 与本地 `npm run docker:build`
+      # 的 tag 规则、平台列表完全一致（脚本会把未知参数原样透传给 buildx）
+      - name: 构建并推送
+        run: node scripts/docker-build.mjs --cache-from type=gha --cache-to type=gha,mode=max
+
+      - name: 写入任务摘要
+        run: |
+          {
+            echo "### 已发布"
+            echo
+            echo "- \`hsiangleev/quark-sync:latest\`"
+            echo "- \`hsiangleev/quark-sync:${{ steps.ver.outputs.version }}\`"
+            echo
+            echo "平台：\`linux/amd64\`、\`linux/arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -7,3 +7,7 @@
 *.sh text eol=lf
 docker-entrypoint.sh text eol=lf
 scripts/*.mjs text eol=lf
+# GitHub Actions 工作流同样必须保持 LF：
+# run: 块里的多行 shell 脚本若带 \r，bash 会把 "pipefail\r" 当成非法参数，
+# 整个步骤直接失败（与上面 shebang 那类问题同源）
+.github/workflows/*.yml text eol=lf

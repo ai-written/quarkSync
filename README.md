@@ -296,16 +296,47 @@ docker compose up -d
 
 首次启动若 `config/config.json` 不存在，会从模板自动生成 —— 记得先填好 `cookie` 和 `webToken` 再重启容器。
 
-#### 自行构建镜像
+#### 发布镜像
 
-发布流程：**先改 `package.json` 的版本号并提交，再构建推送**，这样镜像内记录的版本与 tag 才一致。
+发布流程：**先改 `package.json` 的版本号并提交，再发布**，这样镜像内记录的版本与 tag 才一致。
+
+##### 用 GitHub Actions 发布（推荐）
+
+不需要本地装 Docker，`linux/amd64` 与 `linux/arm64` 都在 GitHub 的 runner 上构建。两种触发方式：
+
+1. 仓库页 → **Actions → Publish Docker image → Run workflow**（手动）
+2. 打 tag 触发（tag 必须与 `package.json` 的版本一致，否则任务会失败）：
+
+```bash
+git tag v<版本号> && git push origin v<版本号>   # 例如 v1.6.1
+```
+
+工作流会读取 `package.json` 的 `version`，推送 `latest` 与 `<版本号>` 两个 tag。
+
+首次使用前要在仓库里配置两个密钥（**Settings → Secrets and variables → Actions → New repository secret**）：
+
+| Secret | 值 |
+| --- | --- |
+| `DOCKERHUB_USERNAME` | Docker Hub 用户名，即 `hsiangleev` |
+| `DOCKERHUB_TOKEN` | Docker Hub 的 Access Token（**不是**登录密码） |
+
+Token 的获取路径：Docker Hub → 右上角头像 → **Account settings** → **Personal access tokens** → **Generate new token**，权限选 **Read & Write**；生成后只显示一次，复制后立刻填进上面的 Secret。
+
+几点说明：
+
+- 工作流直接调用仓库里的 `scripts/docker-build.mjs`，所以 tag 规则、平台列表与本地 `npm run docker:build` 完全一致，不会出现两套规则
+- 有意**不做**成「push 到 main 就自动发布」：版本 tag 一旦发布就应当是不可变的，否则一次依赖升级（同样会改 `package.json`）就可能悄悄覆盖已发布的镜像
+- 若该版本已发布过，任务会直接失败并提示；确实要覆盖时，手动运行并勾选 `overwrite`
+- 公开仓库的 Actions 分钟数免费；私有仓库会消耗每月额度
+
+##### 本地构建
 
 ```bash
 npm run docker:build          # 构建 linux/amd64 + linux/arm64 并推送 latest 与 <版本号>
 npm run docker:build:local    # 仅本地构建（单平台、不推送），用于验证
 ```
 
-`docker:build` 会读取 `package.json` 的 `version`，同时打上 `latest` 与 `1.2.0` 这样的版本 tag；
+`docker:build` 会读取 `package.json` 的 `version`，同时打上 `latest` 与 `<版本号>` 这样的版本 tag；
 发布前若工作区有未提交改动、或 HEAD 中的版本与工作区不一致，会给出警告。
 
 ## 工作流程
