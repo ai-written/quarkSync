@@ -62,6 +62,7 @@ npm run web      # 网页界面 + 定时任务（推荐）
 | --- | --- | --- |
 | 网页界面 + 定时任务 | `npm run web` | 推荐；同进程跑 HTTP 界面与 cron |
 | 单次同步 | `npm run sync` | 检查所有分享、转存新文件后退出 |
+| 试运行同步 | `npm run sync-dry` | 只列出会转存哪些文件，不做任何写入 |
 | 单次下载 | `npm run download` | 把网盘目标文件夹下载到本地 |
 | AList 下载 | `npm run alist` | 从 AList 服务器下载到本地 |
 | 只跑定时任务 | `npm run schedule` | 不带网页界面 |
@@ -107,10 +108,10 @@ npm run web      # 网页界面 + 定时任务（推荐）
 
 | 页面 | 作用 |
 | --- | --- |
-| **分享链接**（默认页） | 表格化维护分享；一行一个，链接格写多行即为「备用链接组」；每项可单独设置影视名称与筛选条件 |
+| **分享链接**（默认页） | 表格化维护分享；一行一个，链接格写多行即为「备用链接组」；每项可单独设置影视名称与筛选条件，顶部可按名称或链接筛选 |
 | **配置** | 表单化编辑其余配置项，保存后**定时任务自动重载，无需重启** |
 | **日志** | 按级别与关键字过滤，可调行数、可自动刷新；日志很大也不卡 |
-| **任务** | 查看各 cron 任务的状态与**下次运行时间**，并可立即手动执行 |
+| **任务** | 查看各 cron 任务的状态与**下次运行时间**，可立即手动执行同步 / 下载，也可以先「试运行同步」预览会转存哪些文件 |
 
 三点需要知道：
 
@@ -159,11 +160,16 @@ Secret 怎么建、为什么不做成 push 自动发布等说明见 **[docs/deta
 | `src/web.js` | 网页后端：HTTP 服务、鉴权、配置读写、日志与任务接口 |
 | `src/ui.html` | 网页前端（零构建，单文件） |
 | `docs/` | [细节说明](docs/details.md)、界面截图、`config.example.json` |
+| `test/` | 单元测试（`npm test`） |
 | `scripts/` | 构建脚本（发布镜像用） |
 
 ## 依赖
 
-[axios](https://github.com/axios/axios)（HTTP 客户端）与 [node-cron](https://github.com/node-cron/node-cron)（定时调度）。网页界面基于 Node 内置 `node:http`，不引入额外依赖。
+[axios](https://github.com/axios/axios)（HTTP 客户端）与 [node-cron](https://github.com/node-cron/node-cron)（定时调度）。网页界面基于 Node 内置 `node:http`，测试用 Node 内置的 `node:test`，都不引入额外依赖。
+
+```bash
+npm test        # 跑单元测试（时长解析、集数去重、多级路径解析等）
+```
 
 ## 许可
 

@@ -14,6 +14,10 @@
   header { background: #1f6feb; color: #fff; padding: 12px 20px; display: flex; align-items: center; gap: 12px;
            flex: none; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  /* 版本号徽标：一眼确认当前跑的是哪个版本；读不到版本号时整块隐藏 */
+  header .ver { font-size: 12px; line-height: 18px; padding: 0 8px; border-radius: 10px;
+                background: rgba(255,255,255,.18); border: 1px solid rgba(255,255,255,.35); }
+  header .ver:empty { display: none; }
   header .sp { flex: 1; }
   header button { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.4); }
   /* 布局：header 与 tabs 固定，只有当前 tab 的面板滚动 */
@@ -153,6 +157,7 @@
 <div id="app" style="display:none">
   <header>
     <h1>quark-sync 管理面板</h1>
+    <span id="versionBadge" class="ver"></span>
     <span class="sp"></span>
     <span id="runningBadge" class="hint" style="color:#fff"></span>
     <button id="logoutBtn">退出</button>
@@ -191,6 +196,7 @@
           </div>
           <div class="actions" style="margin-top:10px">
             <button id="addShare">+ 添加分享</button>
+            <input type="text" id="shareFilter" placeholder="筛选：名称或链接" style="width:200px">
             <span class="hint" id="shareCount"></span>
           </div>
           <div class="hint" style="margin-top:8px">
@@ -577,26 +583,64 @@ function renderShares(list) {
     body.appendChild(tr);
   });
   renumber();
+  // 渲染完再套一次筛选：用户可能一直开着筛选条件（增删行后仍要保持过滤状态）
+  applyShareFilter();
 }
 
+// 刷新序号与「备用组」标记，并更新计数。
+// 这里**不**重新决定可见性：在链接框里打字时若该行不再匹配筛选条件，
+// 行会突然消失并丢掉焦点，输入就断了。
 function renumber() {
-  let total = 0, groups = 0;
   $('shareBody').querySelectorAll('tr.share-row').forEach((tr, i) => {
     const isGroup = rowIsGroup(tr);
     tr.querySelector('.idx').innerHTML =
       `#${i + 1}${isGroup ? '<span class="tag">备用组</span>' : ''}`;
-    total++;
-    if (isGroup) groups++;
   });
+  updateShareCount();
+}
+
+// 计数：总数与备用组数取全表，shown 只数当前可见的行
+function updateShareCount() {
   const el = $('shareCount');
-  if (el) {
-    el.textContent = total === 0
-      ? '尚未配置分享链接'
-      : `共 ${total} 条${groups > 0 ? `（其中 ${groups} 条为备用链接组）` : ''}`;
+  if (!el) return;
+  const box = $('shareFilter');
+  const kw = (box ? box.value : '').trim().toLowerCase();
+  let total = 0, groups = 0, shown = 0;
+  $('shareBody').querySelectorAll('tr.share-row').forEach(tr => {
+    total++;
+    if (rowIsGroup(tr)) groups++;
+    if (tr.style.display !== 'none') shown++;
+  });
+  if (total === 0) {
+    el.textContent = '尚未配置分享链接';
+    return;
   }
+  const groupPart = groups > 0 ? `（其中 ${groups} 条为备用链接组）` : '';
+  // 筛选时不再附「其中 N 条为备用链接组」：那个数字是全表的，可能对应不上眼前这些行
+  el.textContent = kw
+    ? `显示 ${shown} / 共 ${total} 条${shown === 0 ? ' —— 没有匹配的分享' : ''}`
+    : `共 ${total} 条${groupPart}`;
+}
+
+// 分享表格筛选：只隐藏不匹配的行，不重新渲染 —— 重新渲染会丢掉用户尚未保存的编辑。
+// 匹配影视名称与链接两列，空关键字即全部显示。
+function applyShareFilter() {
+  const box = $('shareFilter');
+  const kw = (box ? box.value : '').trim().toLowerCase();
+  $('shareBody').querySelectorAll('tr.share-row').forEach(tr => {
+    const tip = (tr.querySelector('[data-f=tip]') || {}).value || '';
+    const url = (tr.querySelector('[data-f=url]') || {}).value || '';
+    const hit = !kw || tip.toLowerCase().includes(kw) || url.toLowerCase().includes(kw);
+    tr.style.display = hit ? '' : 'none';
+  });
+  updateShareCount();
 }
 
 function addShare() {
+  // 先清空筛选：新加的行是空的，可能不匹配当前筛选条件而被隐藏，
+  // 那样聚焦会失败、用户会觉得按钮没反应
+  const filterBox = $('shareFilter');
+  if (filterBox && filterBox.value) filterBox.value = '';
   const existing = collectShares();
   existing.push({ url: '' });
   renderShares(existing);
@@ -699,6 +743,7 @@ async function loadConfig() {
 }
 
 $('addShare').onclick = () => addShare();
+$('shareFilter').addEventListener('input', applyShareFilter);
 $('reloadBtn').onclick = async () => {
   try { await loadConfig(); notify('已重新载入', true); }
   catch (e) { notify(e.message, false); }
@@ -898,6 +943,7 @@ initCollapsibleCards();
   try {
     const r = await fetch('/api/session');
     const d = await r.json();
+    if (d.version) $('versionBadge').textContent = 'v' + d.version;
     if (!d.authRequired) {
       showMsg('loginMsg', '服务端未配置 webToken，网页功能已禁用。请在 config.json 设置 webToken 后重启。', false);
       showLogin();

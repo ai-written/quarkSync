@@ -3,11 +3,21 @@ import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
 import { fileURLToPath } from 'url';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 源码在 src/ 下，而 config.json、sync.log 等运行期文件留在项目根目录：
 // 这样本地已有配置无需搬动，Docker 里也能继续用 /app/config.json、/app/sync.log 两个软链
 const ROOT = path.resolve(__dirname, '..');
+
+// 版本号：供网页界面与启动日志显示用。读不到就留空，不影响运行
+export const VERSION = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf-8')).version || '';
+  } catch {
+    return '';
+  }
+})();
 
 const LOG_FILE = path.join(ROOT, 'sync.log');
 const DOWNLOADED_FILE = '.downloaded.json';
@@ -217,9 +227,20 @@ export function readLogs({ maxLines = 500, level = '', keyword = '' } = {}) {
   };
 }
 
-export function log(message) {
+// 试运行的输出只有「会转存哪些文件」，进度类日志（步骤、筛选计数、目录解析等）全部静音。
+// 用 AsyncLocalStorage 限定作用域，而不是全局开关：否则同时运行的其它任务
+// （sync 与 alist 用的是两把锁，可以并发）的日志也会被一起吞掉。
+const quietLog = new AsyncLocalStorage();
+
+// 不受静音影响的输出：试运行的最终清单走这里，既能上屏也写进 sync.log
+function logAlways(message) {
   console.log(message);
   writeLog('INFO', message);
+}
+
+export function log(message) {
+  if (quietLog.getStore()) return;
+  logAlways(message);
 }
 
 export function logError(message) {
@@ -490,7 +511,7 @@ async function tryShareUrls(client, pwdIds, passcode, tip, deadSet) {
   return null;
 }
 
-function parseEpisode(fileName) {
+export function parseEpisode(fileName) {
   const name = fileName.replace(/\.[^.]+$/, '');
   let m;
 
@@ -513,7 +534,7 @@ function parseEpisode(fileName) {
   return null;
 }
 
-function sortByEpisode(a, b) {
+export function sortByEpisode(a, b) {
   const pa = parseEpisode(a.file_name);
   const pb = parseEpisode(b.file_name);
   if (pa && pb) {
@@ -525,7 +546,7 @@ function sortByEpisode(a, b) {
   return (b.updated_at || 0) - (a.updated_at || 0);
 }
 
-function getEpisodeKey(fileName) {
+export function getEpisodeKey(fileName) {
   const ep = parseEpisode(fileName);
   if (!ep) return null;
   const name = fileName.replace(/\.[^.]+$/, '');
@@ -541,7 +562,7 @@ function getEpisodeKey(fileName) {
 
 const QUALITY_SCORE = { '4k': 5, '2160p': 4, 'uhd': 4, '1080p': 3, 'fhd': 3, '1080': 3, '720p': 2, 'hd': 2, '720': 2, '高清': 2, '标清': 1, 'sd': 1 };
 
-function getQualityScore(fileName) {
+export function getQualityScore(fileName) {
   const lower = fileName.toLowerCase();
   for (const [kw, score] of Object.entries(QUALITY_SCORE)) {
     if (lower.includes(kw)) return score;
@@ -549,14 +570,18 @@ function getQualityScore(fileName) {
   return 0;
 }
 
-function isHigherQuality(aName, aSize, bName, bSize) {
+export function isHigherQuality(aName, aSize, bName, bSize) {
   const qA = getQualityScore(aName);
   const qB = getQualityScore(bName);
   if (qA !== qB) return qA > qB;
   return (aSize || 0) > (bSize || 0);
 }
 
-function deduplicateByEpisode(files) {
+// 同名集去重：同集保留画质最高的那份（画质相同则取体积更大的）。
+//
+// 这里不直接写日志，而是通过 onSkip 回调交给调用方 —— 保持本函数是纯函数：
+// 单测可以直接调用它，不会把测试输出写进真实的 sync.log。
+export function deduplicateByEpisode(files, { onSkip } = {}) {
   const groups = new Map();
   const unkeyed = [];
   for (const f of files) {
@@ -580,15 +605,15 @@ function deduplicateByEpisode(files) {
     deduped.push(group[0]);
     if (group.length > 1) {
       removed += group.length - 1;
-      log(`   ⏭ 同名集去重: ${key} (${group.length}个版本, 保留 ${group[0].file_name || group[0].name})`);
+      if (onSkip) onSkip(`   ⏭ 同名集去重: ${key} (${group.length}个版本, 保留 ${group[0].file_name || group[0].name})`);
     }
   }
-  if (removed > 0) log(`   → 去重移除 ${removed} 个较低画质版本\n`);
+  if (removed > 0 && onSkip) onSkip(`   → 去重移除 ${removed} 个较低画质版本\n`);
   deduped.push(...unkeyed);
   return deduped;
 }
 
-function getDedupKey(fileItem) {
+export function getDedupKey(fileItem) {
   const name = fileItem.file_name || fileItem.name;
   const epKey = getEpisodeKey(name);
   return epKey || `${name}|${fileItem.size || ''}`;
@@ -844,41 +869,14 @@ class QuarkClient {
     return result;
   }
 
-  async resolveTargetDir(config) {
+  async resolveTargetDir(config, opts = {}) {
     if (config.targetDirFid && config.targetDirFid !== '0') {
       return config.targetDirFid;
     }
     if (!config.targetDirName) {
       return '0';
     }
-    // 目标文件夹名支持多级路径（如 "转存/来自：分享"）：按 / 拆分后逐级查找，不存在则创建。
-    // 每级都以上一级的 fid 作为父目录，因此只支持「从根目录往下」的相对层级；
-    // 空段（开头、结尾或重复的 /）一律忽略，"." 与 ".." 没有特殊含义，按普通名字处理。
-    const segments = String(config.targetDirName).split('/').map(s => s.trim()).filter(Boolean);
-    if (segments.length === 0) {
-      return '0';
-    }
-
-    console.log(`   查找目标文件夹: "${config.targetDirName}"...`);
-    let pdirFid = '0';
-    for (const name of segments) {
-      let fid = await this.findFolderByName(name, pdirFid);
-      if (fid) {
-        console.log(`   ✓ ${name} 已存在，fid: ${fid}`);
-      } else {
-        console.log(`   ${name} 不存在，正在创建...`);
-        fid = await this.createFolder(name, pdirFid);
-        // 拿不到 fid 必须中断：否则下一级会以 undefined 作为父目录，
-        // 服务端可能把它当作根目录，于是余下的层级被静默建到错误位置
-        if (!fid) {
-          throw new Error(`创建目标文件夹失败: ${name}（接口未返回 fid）`);
-        }
-        console.log(`   ✓ ${name} 已创建，fid: ${fid}`);
-      }
-      pdirFid = fid;
-    }
-    console.log('');
-    return pdirFid;
+    return resolveDirPath(this, config.targetDirName, opts);
   }
 
   async getDownloadUrls(fids) {
@@ -967,7 +965,7 @@ class QuarkClient {
     log(`   列出目标文件夹中的文件...`);
     let files = await this.listAllUserFiles(pdirFid);
     const rawCount = files.length;
-    files = deduplicateByEpisode(files);
+    files = deduplicateByEpisode(files, { onSkip: log });
     if (files.length < rawCount) {
       log(`   ✓ 共 ${rawCount} 个文件 (去重后 ${files.length} 个)\n`);
     } else {
@@ -1146,6 +1144,47 @@ class QuarkClient {
   }
 }
 
+// 逐级解析（必要时创建）目标文件夹，返回最终 fid。
+//
+// 只依赖 client 提供 findFolderByName / createFolder，因此不绑定 QuarkClient，
+// 便于单元测试（不触网）。dryRun 为真时只查找、不创建：某级不存在就返回 null，
+// 表示「正式运行时会创建」，调用方据此跳过与已存在文件的比对。
+//
+// 多级路径（如 "转存/来自：分享"）按 / 拆分后逐级查找，每级都以上一级的 fid 作为
+// 父目录，因此只支持「从根目录往下」的相对层级；空段（开头、结尾或重复的 /）一律
+// 忽略，"." 与 ".." 没有特殊含义，按普通名字处理。
+export async function resolveDirPath(client, dirName, { dryRun = false } = {}) {
+  const segments = String(dirName).split('/').map(s => s.trim()).filter(Boolean);
+  if (segments.length === 0) {
+    return '0';
+  }
+
+  // 试运行不打印解析过程（只输出最后的文件清单），因此这里的三处进度一律加 dryRun 判断
+  if (!dryRun) console.log(`   查找目标文件夹: "${dirName}"...`);
+  let pdirFid = '0';
+  for (const name of segments) {
+    let fid = await client.findFolderByName(name, pdirFid);
+    if (fid) {
+      if (!dryRun) console.log(`   ✓ ${name} 已存在，fid: ${fid}`);
+    } else if (dryRun) {
+      // 目录尚不存在：返回 null 表示「正式运行时会创建」，调用方据此跳过比对
+      return null;
+    } else {
+      console.log(`   ${name} 不存在，正在创建...`);
+      fid = await client.createFolder(name, pdirFid);
+      // 拿不到 fid 必须中断：否则下一级会以 undefined 作为父目录，
+      // 服务端可能把它当作根目录，于是余下的层级被静默建到错误位置
+      if (!fid) {
+        throw new Error(`创建目标文件夹失败: ${name}（接口未返回 fid）`);
+      }
+      console.log(`   ✓ ${name} 已创建，fid: ${fid}`);
+    }
+    pdirFid = fid;
+  }
+  if (!dryRun) console.log('');
+  return pdirFid;
+}
+
 // 时长单位（换算为小时）。注意 m = 分钟、mo = 月，两者含义不同：
 // 按常见时长写法惯例，m 作分钟解释，月份用 mo 以免与分钟混淆。
 const DURATION_UNITS = {
@@ -1174,7 +1213,7 @@ export function isValidDuration(value) {
 // 把时间窗口写法换算为小时数。
 // 支持：纯数字（按小时，兼容旧配置）、单位写法（1h / 1d / 1w / 1mo / 1y / 30m）、
 // 以及小数（1.5d、0.5w）。无法解析时返回 fallback。
-function parseDurationHours(value, fallback = 48) {
+export function parseDurationHours(value, fallback = 48) {
   if (value === undefined || value === null || value === '') return fallback;
   if (typeof value === 'number') {
     return Number.isFinite(value) && value >= 0 ? value : fallback;
@@ -1201,7 +1240,7 @@ function parseDurationHours(value, fallback = 48) {
 }
 
 // 人类可读的时长描述，用于日志（把小时数还原成易读形式）
-function formatHours(hours) {
+export function formatHours(hours) {
   if (!Number.isFinite(hours)) return String(hours);
   if (hours === 0) return '0 小时';
   if (hours % (365 * 24) === 0) return `${hours / (365 * 24)} 年`;
@@ -1217,7 +1256,7 @@ function formatHours(hours) {
 // 注意 days 沿用旧实现的三元判断语义（falsy 即视为未配置），因此 days:0
 // 会回退到默认 48 小时 —— 这样既保持向后兼容，也避免误配成「0 天窗口」
 // 导致什么都转存不了。
-function resolveWindowHours(config) {
+export function resolveWindowHours(config) {
   if (config.hours !== undefined && config.hours !== null && config.hours !== '') {
     return parseDurationHours(config.hours, 48);
   }
@@ -1228,7 +1267,7 @@ function resolveWindowHours(config) {
   return 48;
 }
 
-function filterByHours(files, hours) {
+export function filterByHours(files, hours) {
   const cutoff = Date.now() - hours * 60 * 60 * 1000;
   return files.filter(f => {
     if (f.dir) return false;
@@ -1239,7 +1278,7 @@ function filterByHours(files, hours) {
 }
 
 // 在扩展名前插入 " (n)"：a.mp4 -> a (2).mp4；无扩展名（含 .gitignore 这类）则直接追加
-function withNumericSuffix(name, n) {
+export function withNumericSuffix(name, n) {
   const dot = name.lastIndexOf('.');
   if (dot <= 0) return `${name} (${n})`;
   return `${name.slice(0, dot)} (${n})${name.slice(dot)}`;
@@ -1331,8 +1370,24 @@ async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {})
   return out;
 }
 
+// 统一的「文件 + 更新时间」行：正式运行逐条打印，试运行先收集、最后一次性打印
+function buildFileLines(files) {
+  return files.map(f => {
+    const date = new Date(String(f.updated_at).length <= 10 ? f.updated_at * 1000 : f.updated_at);
+    return `  - ${f.file_name}  (更新于: ${date.toLocaleString('zh-CN')})`;
+  });
+}
+
 // 统一同步实现：CLI(sync 模式) 与 cron/网页触发共用同一份逻辑
-async function syncInternal(config) {
+async function syncInternal(config, opts = {}) {
+  const { dryRun = false } = opts;
+  // 试运行只回答「会转存哪些文件」：整个流程静音进度日志，只保留 logError 与函数末尾那份清单。
+  // 这里自我包裹一次即可（第二遍进来时 store 已存在，不会递归）；
+  // opts 原样透传，避免以后新增选项在这里被静默丢掉。
+  if (dryRun && !quietLog.getStore()) {
+    return quietLog.run(true, () => syncInternal(config, opts));
+  }
+
   if (!config.cookie || config.cookie === '从浏览器复制的完整 Cookie 字符串') {
     throw new Error('请在 config.json 中填写有效的 Cookie');
   }
@@ -1361,12 +1416,16 @@ async function syncInternal(config) {
   }
 
   log('1. 确定保存目标文件夹...');
-  const targetDirFid = await client.resolveTargetDir(config);
+  // 试运行时只查找、不创建：目录尚不存在会返回 null，表示正式运行时会创建它
+  const targetDirFid = await client.resolveTargetDir(config, { dryRun });
 
   let totalSuccess = 0;
   let totalFailed = 0;
   const allSuccess = [];
   const allFailed = [];
+  // 试运行模式下累计「本会转存多少文件」，并收集清单，用于最后统一输出
+  let dryRunWouldTransfer = 0;
+  const dryRunEntries = [];
   // 任务期间判定为已失效的分享 ID，用于按需清理配置
   const deadPwdIds = new Set();
   let prunedUrls = null;
@@ -1459,7 +1518,8 @@ async function syncInternal(config) {
       }
 
       log('   检查目标文件夹中已存在的文件...');
-      const existingMap = await client.getExistingFileMap(targetDirFid);
+      // 试运行且目标文件夹尚不存在时无从比对，视为空目录（正式运行时它会是新建的空目录）
+      const existingMap = targetDirFid ? await client.getExistingFileMap(targetDirFid) : new Map();
       const newFiles = largeFiles.filter(f => {
         const key = `${f.file_name}|${f.size || ''}`;
         if (existingMap.has(key)) return false;
@@ -1480,11 +1540,18 @@ async function syncInternal(config) {
         continue;
       }
 
-      log('待转存文件列表:');
-      for (const f of newFiles) {
-        const date = new Date(String(f.updated_at).length <= 10 ? f.updated_at * 1000 : f.updated_at);
-        log(`  - ${f.file_name}  (更新于: ${date.toLocaleString('zh-CN')})`);
+      // 试运行：不在这里打印（进度已静音），改为收集起来，函数末尾一次性输出
+      if (dryRun) {
+        dryRunWouldTransfer += newFiles.length;
+        dryRunEntries.push({
+          label: shareTip || pwdIds[0] || `第 ${si + 1} 个分享`,
+          lines: buildFileLines(newFiles),
+        });
+        continue;
       }
+
+      log('待转存文件列表:');
+      for (const line of buildFileLines(newFiles)) log(line);
       log('');
 
       log('4. 开始转存文件到自己的网盘...');
@@ -1517,6 +1584,30 @@ async function syncInternal(config) {
     }
   }
 
+  // 试运行到此为止：上面全程静音，这里只输出「会转存哪些文件」这一件事（错误日志照常输出）
+  if (dryRun) {
+    logAlways('待转存文件列表:');
+    if (dryRunEntries.length === 0) {
+      logAlways('  （没有需要转存的文件）');
+    } else if (dryRunEntries.length === 1) {
+      // 只有一个分享：直接平铺清单，最简洁
+      for (const line of dryRunEntries[0].lines) logAlways(line);
+    } else {
+      // 多个分享时按分享分组，否则看不出哪个文件来自哪个分享
+      for (const entry of dryRunEntries) {
+        logAlways(`[${entry.label}]`);
+        for (const line of entry.lines) logAlways(line);
+      }
+    }
+    logAlways('');
+    logAlways(`共 ${dryRunWouldTransfer} 个文件会被转存（试运行，未做任何写入）`);
+    return {
+      dryRun: true, wouldTransfer: dryRunWouldTransfer,
+      totalSuccess: 0, totalFailed: 0, allSuccess: [], allFailed: [],
+      deadPwdIds: [...deadPwdIds], prunedUrls: null,
+    };
+  }
+
   if (shareUrls.length > 1) {
     log(`\n${'═'.repeat(50)}`);
     log('=== 全部转存结果汇总 ===');
@@ -1546,6 +1637,7 @@ async function syncInternal(config) {
   if (deadPwdIds.size > 0) {
     log(`\n发现 ${deadPwdIds.size} 个已失效的分享链接: ${[...deadPwdIds].join(', ')}`);
   }
+
   if (deadPwdIds.size > 0 && config.pruneDeadShares === true) {
     const original = normalizeShareUrls({ ...config, shareUrls: config.shareUrls });
     const { shareUrls: pruned, removed } = pruneDeadUrls(original, deadPwdIds);
@@ -1580,15 +1672,15 @@ async function syncInternal(config) {
 }
 
 // CLI 入口：保持原有日志与退出语义
-async function syncMode() {
-  log('=== 夸克网盘自动同步工具 ===\n');
+async function syncMode(dryRun = false) {
+  log(dryRun ? '=== 夸克网盘自动同步工具（试运行） ===\n' : '=== 夸克网盘自动同步工具 ===\n');
   const config = loadConfigOrExit();
-  await withTaskLock('sync', () => syncInternal(config));
+  await withTaskLock('sync', () => syncInternal(config, { dryRun }));
 }
 
 // cron / 网页触发入口：每次执行前重新读取配置（支持热更新）
-export async function runSync(config) {
-  return withTaskLock('sync', () => syncInternal(config ?? loadConfig()));
+export async function runSync(config, opts) {
+  return withTaskLock('sync', () => syncInternal(config ?? loadConfig(), opts));
 }
 
 // 同步 + AList 下载串联执行（供 downloadAfterSync 开启时的定时任务使用）。
@@ -1734,7 +1826,7 @@ class AlistClient {
     log(`   列出文件夹: ${alistPath} ...`);
     let files = await this.listAllFiles(alistPath);
     const rawCount = files.length;
-    files = deduplicateByEpisode(files);
+    files = deduplicateByEpisode(files, { onSkip: log });
     if (files.length < rawCount) {
       log(`   ✓ 共 ${rawCount} 个文件 (去重后 ${files.length} 个)\n`);
     } else {
@@ -1839,7 +1931,7 @@ async function alistMode(forceDownload = false) {
   }
 }
 
-function normalizeShareUrls(config) {
+export function normalizeShareUrls(config) {
   if (Array.isArray(config.shareUrls) && config.shareUrls.length > 0) {
     return config.shareUrls.map(u => typeof u === 'string' ? { url: u } : u);
   }
@@ -1980,6 +2072,15 @@ async function alistInternal(config) {
 function main() {
   const mode = process.argv[2];
   const forceDownload = process.argv.includes('--force-download') || process.argv.includes('--no-skip');
+  const dryRun = process.argv.includes('--dry-run');
+
+  // --dry-run 目前只实现在同步模式：其他模式若静默忽略它，用户会误以为「没写入」
+  const nonSyncModes = ['--download', 'download', '--schedule', 'schedule', '--alist', 'alist', '--web', 'web'];
+  if (dryRun && nonSyncModes.includes(mode)) {
+    logError('错误: --dry-run 只支持同步模式，例如: node src/index.js --dry-run（或 npm run sync-dry）');
+    process.exit(1);
+  }
+
   if (mode === '--download' || mode === 'download') {
     downloadMode(forceDownload).catch(err => {
       logError('\n程序异常: ' + err.message);
@@ -2003,7 +2104,7 @@ function main() {
         process.exit(1);
       });
   } else {
-    syncMode().catch(err => {
+    syncMode(dryRun).catch(err => {
       logError('\n程序异常: ' + err.message);
       process.exit(1);
     });

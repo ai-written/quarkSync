@@ -17,6 +17,7 @@ import {
   getRunningTasks,
   isTaskRunning,
   isValidDuration,
+  VERSION,
 } from './index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -241,12 +242,14 @@ function readBody(req, limit = 1024 * 1024) {
 // 任务键 "sync:0"/"alist:0" 或手动键 "sync"/"alist" 都归一到同一实现
 function isRunnableKey(key) {
   const k = String(key);
-  if (k === 'sync' || k === 'alist') return true;
+  if (k === 'sync' || k === 'alist' || k === 'sync-dry') return true;
   return listScheduledTasks().some(t => t.key === k);
 }
 
 async function triggerTask(key) {
   const k = String(key);
+  // 试运行：只列出会转存哪些文件，不做任何写入
+  if (k === 'sync-dry') return runSync(undefined, { dryRun: true });
   if (k === 'sync' || k.startsWith('sync:')) return runSync();
   if (k === 'alist' || k.startsWith('alist:')) return runAlist();
   throw new Error(`未知任务: ${key}`);
@@ -363,7 +366,7 @@ function createServer() {
         const sid = parseCookies(req.headers.cookie)[COOKIE_NAME];
         const tk = currentToken();
         const ok = Boolean(tk) && validSession(sid);
-        sendJson(res, 200, { authenticated: ok, authRequired: Boolean(tk) });
+        sendJson(res, 200, { authenticated: ok, authRequired: Boolean(tk), version: VERSION });
         return;
       }
 
@@ -434,6 +437,7 @@ function createServer() {
           running: getRunningTasks(),
           manual: [
             { key: 'sync', name: '同步模式', running: isTaskRunning('sync') },
+            { key: 'sync-dry', name: '试运行同步（只列出会转存什么）', running: isTaskRunning('sync') },
             { key: 'alist', name: 'AList下载', running: isTaskRunning('alist') },
           ],
         });
@@ -504,7 +508,8 @@ export async function startWebServer() {
   const port = Number(config.webPort) || 3000;
   const host = config.webHost || '0.0.0.0';
 
-  log('=== 夸克网盘定时任务 ===\n');
+  // 启动日志里带上版本号：容器里用 docker logs 就能确认跑的是哪个版本
+  log(`=== 夸克网盘定时任务${VERSION ? ' v' + VERSION : ''} ===\n`);
   const reg = registerScheduledTasks();
   if (reg.registered === 0 && reg.errors.length === 0) {
     log('   （未配置 syncCron / alistCron，仅网页手动触发可用）');

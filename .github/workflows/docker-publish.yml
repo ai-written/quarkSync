@@ -33,6 +33,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 先跑测试再构建：测试挂了就不该发布镜像
+      - name: 安装依赖并跑测试
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
+
       # 版本号是唯一的 tag 来源：脚本会据此同时打 latest 与 <version>
       - name: 读取版本号
         id: ver
