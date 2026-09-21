@@ -108,6 +108,10 @@
   .msg { padding: 9px 12px; border-radius: 6px; margin-bottom: 12px; display: none; white-space: pre-wrap; }
   .msg.ok { background: #dafbe1; color: #0a5222; border: 1px solid #a7e0b8; display: block; }
   .msg.err { background: #ffebe9; color: #8b1a1a; border: 1px solid #ffc1bd; display: block; }
+  /* 提示条吸顶：配置 / 任务面板自身滚动，用户滚到下方时保存结果会滚出视野，
+     故让面板内的提示条粘在滚动区顶部（内容从它下方滚过）。
+     分享页的提示条不在滚动容器里（面板不滚、表格自己滚），sticky 自动退化为普通定位 */
+  .panel.active > .msg { position: sticky; top: 0; z-index: 4; flex: none; }
   pre.logs { background: #0d1117; color: #c9d1d9; padding: 12px; border-radius: 6px; overflow: auto;
              flex: 1; min-height: 0; max-height: none; font-size: 12px; line-height: 1.55; margin: 0;
              white-space: pre-wrap; word-break: break-all; }
@@ -349,6 +353,7 @@
 
     <!-- ============ 日志 ============ -->
     <div class="panel" id="panel-logs">
+      <div id="logMsg" class="msg"></div>
       <div class="card">
         <div class="filters">
           <select id="logLevel">
@@ -408,12 +413,17 @@ function showMsg(el, text, ok) {
   if (ok) setTimeout(() => { if (e.textContent === text) e.className = 'msg'; }, 4000);
 }
 
-// 保存栏是常驻的，提示要显示在当前可见的面板里（分享页或配置页），
-// 否则用户在分享页点保存会看不到任何反馈
-function notify(text, ok) {
+// 保存栏在任何 tab 下都可见，因此提示必须落在「当前可见」的面板里：
+// 写进非激活面板（display:none）等于没有任何反馈
+const MSG_IDS = { 'panel-shares': 'shareMsg', 'panel-config': 'cfgMsg',
+                  'panel-logs': 'logMsg', 'panel-tasks': 'taskMsg' };
+function msgTarget() {
   const active = document.querySelector('.panel.active');
-  const target = active && active.id === 'panel-shares' ? 'shareMsg' : 'cfgMsg';
-  showMsg(target, text, ok);
+  return (active && MSG_IDS[active.id]) || 'cfgMsg';
+}
+
+function notify(text, ok) {
+  showMsg(msgTarget(), text, ok);
 }
 
 async function api(method, url, body) {
@@ -750,14 +760,14 @@ $('saveBtn').onclick = async () => {
     await loadConfig();
     refreshTasks();
     // 提示显示在当前可见面板（用户可能已切换 tab）
-    const msgEl = (document.querySelector('.panel.active') || {}).id === 'panel-shares' ? 'shareMsg' : 'cfgMsg';
+    const msgEl = msgTarget();
     showMsg(msgEl, '保存成功，定时任务已重载（' + d.tasksRegistered + ' 个）'
       + (d.isSymlink ? '，已正确写入软链接指向的真实文件' : ''), true);
     if (d.taskErrors && d.taskErrors.length) {
       showMsg(msgEl, '配置已保存，但部分 cron 无效：\n- ' + d.taskErrors.join('\n- '), false);
     }
   } catch (e) {
-    const msgEl = (document.querySelector('.panel.active') || {}).id === 'panel-shares' ? 'shareMsg' : 'cfgMsg';
+    const msgEl = msgTarget();
     showMsg(msgEl, '保存失败：' + e.message, false);
   } finally {
     $('saveBtn').disabled = false;
