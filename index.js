@@ -848,16 +848,34 @@ class QuarkClient {
     if (!config.targetDirName) {
       return '0';
     }
-    console.log(`   查找目标文件夹: "${config.targetDirName}"...`);
-    let fid = await this.findFolderByName(config.targetDirName);
-    if (fid) {
-      console.log(`   ✓ 已存在，fid: ${fid}\n`);
-      return fid;
+    // 目标文件夹名支持多级路径（如 "转存/来自：分享"）：按 / 拆分后逐级查找，不存在则创建。
+    // 每级都以上一级的 fid 作为父目录，因此只支持「从根目录往下」的相对层级；
+    // 空段（开头、结尾或重复的 /）一律忽略，"." 与 ".." 没有特殊含义，按普通名字处理。
+    const segments = String(config.targetDirName).split('/').map(s => s.trim()).filter(Boolean);
+    if (segments.length === 0) {
+      return '0';
     }
-    console.log(`   文件夹不存在，正在创建...`);
-    fid = await this.createFolder(config.targetDirName);
-    console.log(`   ✓ 已创建，fid: ${fid}\n`);
-    return fid;
+
+    console.log(`   查找目标文件夹: "${config.targetDirName}"...`);
+    let pdirFid = '0';
+    for (const name of segments) {
+      let fid = await this.findFolderByName(name, pdirFid);
+      if (fid) {
+        console.log(`   ✓ ${name} 已存在，fid: ${fid}`);
+      } else {
+        console.log(`   ${name} 不存在，正在创建...`);
+        fid = await this.createFolder(name, pdirFid);
+        // 拿不到 fid 必须中断：否则下一级会以 undefined 作为父目录，
+        // 服务端可能把它当作根目录，于是余下的层级被静默建到错误位置
+        if (!fid) {
+          throw new Error(`创建目标文件夹失败: ${name}（接口未返回 fid）`);
+        }
+        console.log(`   ✓ ${name} 已创建，fid: ${fid}`);
+      }
+      pdirFid = fid;
+    }
+    console.log('');
+    return pdirFid;
   }
 
   async getDownloadUrls(fids) {

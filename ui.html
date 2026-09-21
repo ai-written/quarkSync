@@ -34,7 +34,10 @@
   #panel-logs .filters { flex: none; }
   .card { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 16px; margin-bottom: 14px; }
   .card h2 { font-size: 14px; margin: 0 0 12px; color: #1f2328; }
-  .grid { display: grid; grid-template-columns: 180px 1fr; gap: 10px 14px; align-items: center; }
+  /* 按基线对齐：右侧单元格里常是「输入框 + 提示行」，若用 center，
+     标签会相对整个单元格（含提示行）居中而显得偏下；基线对齐让标签文字
+     与输入框内的文字同一行，提示行再长也不影响 */
+  .grid { display: grid; grid-template-columns: 180px 1fr; gap: 10px 14px; align-items: baseline; }
   .grid label { color: #57606a; }
 
   /* 可折叠的一级卡片：仅带 data-card 的卡片才有可点击的视觉暗示，
@@ -167,7 +170,7 @@
     <div class="panel active" id="panel-shares">
       <div id="shareMsg" class="msg"></div>
       <div class="card">
-        <div class="card-hd"><h2>分享链接 <span class="hint" style="font-weight:400">（每项可单独覆盖时间窗口 / 最小体积 / 数量限制）</span></h2></div>
+        <div class="card-hd"><h2>分享链接 <span class="hint" style="font-weight:400">（每项可单独覆盖多久内更新 / 最小体积 / 最多转存）</span></h2></div>
         <div class="card-bd">
           <div class="tablewrap">
             <table class="share-table">
@@ -177,9 +180,9 @@
                   <th style="width:110px">影视名称</th>
                   <th style="min-width:220px">链接</th>
                   <th style="width:82px">提取码</th>
-                  <th style="width:88px">时间窗口</th>
-                  <th style="width:82px">最小 MB</th>
-                  <th style="width:82px">最多数量</th>
+                  <th style="width:88px" title="只转存「更新时间」在最近这段时间内的文件，如 24（小时）、12h、1d">多久内更新</th>
+                  <th style="width:92px" title="小于这个体积（MB）的文件不转存，0 表示不过滤">最小体积 MB</th>
+                  <th style="width:82px" title="按更新时间从新到旧，每个分享最多转存这么多个文件，0 表示不限制">最多转存</th>
                   <th style="width:64px"></th>
                 </tr>
               </thead>
@@ -192,7 +195,8 @@
           </div>
           <div class="hint" style="margin-top:8px">
             链接格一行一个链接；写多行即为「备用链接组」，按顺序 failover（前一个失效才试下一个）。<br>
-            覆盖项留空 = 继承全局；填 0 = 显式覆盖（最小体积/数量为不限制）。
+            多久内更新 / 最小体积 / 最多转存留空 = 沿用配置页里的全局设置；最小体积、最多转存填 0 = 显式覆盖为「不限制」（多久内更新填 0 则什么都转存不了）。<br>
+            影视名称、提取码留空 = 不重命名、不填提取码（磁盘配置里若仍留有对应的全局字段，会作为回退生效）。
           </div>
         </div>
       </div>
@@ -221,13 +225,15 @@
             <h3>转存目标</h3>
             <div class="grid">
               <label>目标文件夹名</label>
-              <input type="text" id="targetDirName" placeholder="来自：分享">
-              <label>目标文件夹 ID</label>
-              <input type="text" id="targetDirFid" placeholder="优先级高于文件夹名，留空则用名称查找">
-              <!-- 全局 tip 有意不在界面暴露：前缀改由每个分享自己的 tip（「影视名称」列）维护。
-                   磁盘上若已存在 config.tip，仍会作为该分享未填时的回退生效，且保存时原样保留。 -->
-              <label>默认提取码</label>
-              <input type="text" id="password" placeholder="分享默认提取码">
+              <div>
+                <input type="text" id="targetDirName" placeholder="来自：分享">
+                <div class="hint">支持多级路径，如 <code>转存/来自：分享</code>；不存在的层级会自动创建（只从根目录往下）。</div>
+                <div class="hint" id="targetDirFidNote" style="display:none;color:#b62222"></div>
+              </div>
+              <!-- 全局 targetDirFid / tip / password 有意不在界面暴露：
+                   目标文件夹 ID 是手改配置时的高级选项（优先级高于文件夹名，可在同名文件夹中精确指定）；
+                   文件名前缀与提取码改为在「分享链接」页逐个分享维护。
+                   磁盘上若已有这些字段，仍会照常生效，且保存时原样保留、不会被清掉。 -->
             </div>
           </div>
         </div>
@@ -240,20 +246,20 @@
           <div class="subcard">
             <h3>筛选与转存</h3>
             <div class="grid">
-              <label>时间窗口</label>
+              <label>多久内更新</label>
               <div>
                 <input type="text" id="hours" placeholder="24 或 1d">
-                <div class="hint">支持单位：<code>30m</code> 分钟、<code>12h</code> 小时、<code>1d</code> 天、<code>1w</code> 周、<code>1mo</code> 月（30 天）、<code>1y</code> 年；也可直接填数字（按小时）。注意 0 会转存不了任何文件。</div>
+                <div class="hint">只转存「更新时间」在最近这段时间内的文件。支持单位：<code>30m</code> 分钟、<code>12h</code> 小时、<code>1d</code> 天、<code>1w</code> 周、<code>1mo</code> 月（30 天）、<code>1y</code> 年；也可直接填数字（按小时）。注意 0 会转存不了任何文件。</div>
               </div>
-              <label>最小文件大小 MB</label>
+              <label>最小文件体积 MB</label>
               <div>
                 <input type="number" id="minFileSizeMB" min="0">
-                <div class="hint">0 表示不过滤。</div>
+                <div class="hint">小于这个体积的文件不转存；0 表示不过滤。</div>
               </div>
-              <label>每分享最多转存</label>
+              <label>每个分享最多转存</label>
               <div>
                 <input type="number" id="maxFilesPerShare" min="0">
-                <div class="hint">0 表示不限制。</div>
+                <div class="hint">按更新时间从新到旧，最多转存这么多个文件；0 表示不限制。</div>
               </div>
               <label>轮询间隔 ms</label>
               <input type="number" id="pollInterval" min="0">
@@ -268,7 +274,7 @@
           <div class="subcard">
             <h3>下载与清理</h3>
             <div class="grid">
-              <label>下载目录</label>
+              <label>本地下载目录</label>
               <input type="text" id="downloadDir" placeholder="./downloads">
               <label>下载后删除云端</label>
               <div><input type="checkbox" id="deleteAfterDownload"> <span class="hint">下载成功后删除网盘文件</span></div>
@@ -285,8 +291,11 @@
             <div class="grid">
               <label>AList 地址</label>
               <input type="text" id="alistUrl" placeholder="http://127.0.0.1:19336">
-              <label>AList 路径</label>
-              <input type="text" id="alistPath" placeholder="/kuake/来自：分享">
+              <label>AList 源目录</label>
+              <div>
+                <input type="text" id="alistPath" placeholder="/kuake/来自：分享">
+                <div class="hint">AList 服务器上要下载的目录，其中的文件会下载到上面的本地下载目录。</div>
+              </div>
               <label>AList Token</label>
               <input type="text" id="alistToken">
               <label>绕过缓存</label>
@@ -547,7 +556,7 @@ function renderShares(list) {
       <td><input type="text" data-f="tip" value="${esc(obj.tip)}" placeholder="如：遮天"></td>
       <td><textarea rows="${urlIsArr ? 3 : 1}" data-f="url"
             placeholder="https://pan.quark.cn/s/xxxxxx&#10;（换行填写多个即为备用链接组）">${esc(urlText)}</textarea></td>
-      <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="继承"></td>
+      <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="如：1234"></td>
       <td><input type="text" data-f="hours" value="${esc(obj.hours)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="minFileSizeMB" value="${esc(obj.minFileSizeMB)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="maxFilesPerShare" value="${esc(obj.maxFilesPerShare)}" placeholder="继承"></td>
@@ -650,9 +659,20 @@ async function loadConfig() {
   $('webToken').placeholder = c.__webTokenSet ? '已配置（' + c.webToken + '），留空保持不变' : '至少 8 位';
 
   $('targetDirName').value = c.targetDirName ?? '';
-  $('targetDirFid').value = c.targetDirFid ?? '';
-  // 全局 tip 已从界面移除，这里不再回填；保存时它作为「未知字段」从 currentConfig 原样带回
-  $('password').value = c.password ?? '';
+  // targetDirFid 虽然不在界面暴露，但后端仍优先采用它（见 index.js 的 resolveTargetDir）：
+  // 磁盘上若设了它，在这里改「目标文件夹名」不会有任何效果，必须显式提示，否则是静默失败
+  const fidOnDisk = c.targetDirFid === undefined || c.targetDirFid === null ? '' : String(c.targetDirFid).trim();
+  const fidNote = $('targetDirFidNote');
+  if (fidOnDisk !== '' && fidOnDisk !== '0') {
+    fidNote.style.display = 'block';
+    fidNote.textContent = '注意：磁盘配置里设了「目标文件夹 ID」' + fidOnDisk
+      + '，它的优先级高于上面的名称，转存会以它为准；如需改用名称，请直接编辑 config.json 删掉 targetDirFid 字段。';
+  } else {
+    fidNote.style.display = 'none';
+    fidNote.textContent = '';
+  }
+  // 全局 targetDirFid / tip / password 已从界面移除，这里不再回填；
+  // 保存时它们作为「未知字段」从 currentConfig 原样带回
   $('hours').value = c.hours ?? '';
   $('minFileSizeMB').value = c.minFileSizeMB ?? '';
   $('maxFilesPerShare').value = c.maxFilesPerShare ?? '';
@@ -693,16 +713,18 @@ $('saveBtn').onclick = async () => {
     out[k] = currentConfig[k];
   }
 
-  // 全局 tip 已从界面移除：合法的字符串原样保留（作为未填该项的分享的回退），
-  // 非字符串（手写配置里的 null / 数字）直接丢弃 —— 否则后端校验会拒掉整个保存，
-  // 而报错指向的字段在界面上根本不存在，无法自查
-  if (typeof out.tip !== 'string') delete out.tip;
+  // 全局 targetDirFid / tip / password 已从界面移除：字符串原样保留（它们仍在后端生效），
+  // 数字按旧界面 input.value 的行为转成字符串，其余（手写配置里的 null / 布尔 / 对象）
+  // 直接丢弃 —— 否则后端校验会拒掉整个保存，而报错指向的字段界面上根本不存在，无法自查
+  for (const k of ['targetDirFid', 'tip', 'password']) {
+    if (typeof out[k] === 'number') out[k] = String(out[k]);
+    else if (typeof out[k] !== 'string') delete out[k];
+  }
 
   const setStr = (k, el) => { const v = $(el).value.trim(); if (v === '') delete out[k]; else out[k] = v; };
   setStr('targetDirName', 'targetDirName');
-  setStr('targetDirFid', 'targetDirFid');
-  // 不再 setStr('tip', ...)：全局 tip 已从界面移除，交给上面的未知字段保留逻辑原样带过
-  setStr('password', 'password');
+  // 不再对 tip / password / targetDirFid 调 setStr：这三个全局字段已从界面移除，
+  // 由上面的保留 / 丢弃逻辑处理，保存时原样带过
   setStr('downloadDir', 'downloadDir');
   setStr('alistUrl', 'alistUrl');
   setStr('alistPath', 'alistPath');
