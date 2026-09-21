@@ -5,7 +5,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY index.js web.js ui.html quark-sync.ico config.example.json docker-entrypoint.sh ./
+COPY src/ ./src/
+COPY docs/config.example.json ./config.example.json
+COPY docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh
 
 RUN mkdir -p /app/config /app/logs /app/downloads
@@ -17,4 +19,4 @@ VOLUME ["/app/downloads"]
 EXPOSE 3000
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["node", "index.js", "web"]
+CMD ["node", "src/index.js", "web"]

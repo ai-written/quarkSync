@@ -5,8 +5,11 @@ import cron from 'node-cron';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// 源码在 src/ 下，而 config.json、sync.log 等运行期文件留在项目根目录：
+// 这样本地已有配置无需搬动，Docker 里也能继续用 /app/config.json、/app/sync.log 两个软链
+const ROOT = path.resolve(__dirname, '..');
 
-const LOG_FILE = path.join(__dirname, 'sync.log');
+const LOG_FILE = path.join(ROOT, 'sync.log');
 const DOWNLOADED_FILE = '.downloaded.json';
 
 function now() {
@@ -351,9 +354,9 @@ function acquireLock(lockName, lockDir) {
 }
 
 export function loadConfig() {
-  const configPath = path.join(__dirname, 'config.json');
+  const configPath = path.join(ROOT, 'config.json');
   if (!fs.existsSync(configPath)) {
-    throw new Error('找不到 config.json，请复制 config.example.json 并填写配置');
+    throw new Error('找不到 config.json，请复制 docs/config.example.json 并填写配置');
   }
   const raw = fs.readFileSync(configPath, 'utf-8');
   try {
@@ -364,7 +367,7 @@ export function loadConfig() {
 }
 
 export function getConfigPath() {
-  return path.join(__dirname, 'config.json');
+  return path.join(ROOT, 'config.json');
 }
 
 // 原子写入配置。Docker 下 config.json 是指向 /app/config/config.json 的软链接，
