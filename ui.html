@@ -170,7 +170,7 @@
               <thead>
                 <tr>
                   <th style="width:44px">#</th>
-                  <th style="width:110px">前缀 tip</th>
+                  <th style="width:110px">影视名称</th>
                   <th style="min-width:220px">链接</th>
                   <th style="width:82px">提取码</th>
                   <th style="width:88px">时间窗口</th>
@@ -220,8 +220,8 @@
               <input type="text" id="targetDirName" placeholder="来自：分享">
               <label>目标文件夹 ID</label>
               <input type="text" id="targetDirFid" placeholder="优先级高于文件夹名，留空则用名称查找">
-              <label>文件名前缀 tip</label>
-              <input type="text" id="tip" placeholder="如：遮天-">
+              <!-- 全局 tip 有意不在界面暴露：前缀改由每个分享自己的 tip（「影视名称」列）维护。
+                   磁盘上若已存在 config.tip，仍会作为该分享未填时的回退生效，且保存时原样保留。 -->
               <label>默认提取码</label>
               <input type="text" id="password" placeholder="分享默认提取码">
             </div>
@@ -534,7 +534,7 @@ function renderShares(list) {
     tr.className = 'share-row';
     tr.innerHTML = `
       <td class="idx"></td>
-      <td><input type="text" data-f="tip" value="${esc(obj.tip)}" placeholder="继承"></td>
+      <td><input type="text" data-f="tip" value="${esc(obj.tip)}" placeholder="如：遮天"></td>
       <td><textarea rows="${urlIsArr ? 3 : 1}" data-f="url"
             placeholder="https://pan.quark.cn/s/xxxxxx&#10;（换行填写多个即为备用链接组）">${esc(urlText)}</textarea></td>
       <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="继承"></td>
@@ -641,7 +641,7 @@ async function loadConfig() {
 
   $('targetDirName').value = c.targetDirName ?? '';
   $('targetDirFid').value = c.targetDirFid ?? '';
-  $('tip').value = c.tip ?? '';
+  // 全局 tip 已从界面移除，这里不再回填；保存时它作为「未知字段」从 currentConfig 原样带回
   $('password').value = c.password ?? '';
   $('hours').value = c.hours ?? '';
   $('minFileSizeMB').value = c.minFileSizeMB ?? '';
@@ -683,10 +683,15 @@ $('saveBtn').onclick = async () => {
     out[k] = currentConfig[k];
   }
 
+  // 全局 tip 已从界面移除：合法的字符串原样保留（作为未填该项的分享的回退），
+  // 非字符串（手写配置里的 null / 数字）直接丢弃 —— 否则后端校验会拒掉整个保存，
+  // 而报错指向的字段在界面上根本不存在，无法自查
+  if (typeof out.tip !== 'string') delete out.tip;
+
   const setStr = (k, el) => { const v = $(el).value.trim(); if (v === '') delete out[k]; else out[k] = v; };
   setStr('targetDirName', 'targetDirName');
   setStr('targetDirFid', 'targetDirFid');
-  setStr('tip', 'tip');
+  // 不再 setStr('tip', ...)：全局 tip 已从界面移除，交给上面的未知字段保留逻辑原样带过
   setStr('password', 'password');
   setStr('downloadDir', 'downloadDir');
   setStr('alistUrl', 'alistUrl');
