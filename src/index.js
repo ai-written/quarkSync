@@ -29,6 +29,8 @@ function now() {
 const LOG_RETENTION_DAYS = 7;
 const LOG_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DOWNLOAD_TIMEOUT_MS = 10800000;
+// 日志里的分隔线：正式运行用它分隔多个分享，试运行用它把文件清单围起来
+const LOG_RULE = '═'.repeat(50);
 let lastLogCleanupAt = 0;
 
 // 日志时间戳为 Asia/Shanghai 显示值，按该时区（无夏令时）还原为 UTC 毫秒
@@ -1284,6 +1286,14 @@ export function withNumericSuffix(name, n) {
   return `${name.slice(0, dot)} (${n})${name.slice(dot)}`;
 }
 
+// 前缀的规范化写法：tip 以 '-' 结尾就原样用，否则补一个 '-'。
+// applyNamePrefix 与试运行预览共用同一份规则，避免两处漂移导致预览的名字与
+// 实际转存后的名字对不上。
+export function normalizePrefix(tip) {
+  if (!tip) return '';
+  return tip.endsWith('-') ? tip : `${tip}-`;
+}
+
 // 给刚转存的文件加上文件名前缀，返回实际使用的文件名数组（顺序与 names 一致）。
 //
 // 关于重名：若「前缀 + 原名」已被占用，不能简单跳过——那会留下一个没有前缀的
@@ -1302,7 +1312,7 @@ async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {})
   await new Promise(r => setTimeout(r, settleMs));
 
   log('   添加文件名前缀...');
-  const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
+  const prefix = normalizePrefix(shareTip);
 
   let existingFiles = await client.listAllUserFiles(targetDirFid);
   const taken = new Set(existingFiles.map(f => f.file_name));
@@ -1370,11 +1380,15 @@ async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {})
   return out;
 }
 
-// 统一的「文件 + 更新时间」行：正式运行逐条打印，试运行先收集、最后一次性打印
-function buildFileLines(files) {
+// 统一的「文件 + 更新时间」行：正式运行逐条打印，试运行先收集、最后一次性打印。
+// opts.prefix 是该分享的影视名称：列出的就是加前缀之后的最终文件名，与正式运行结束时
+// 「成功转存的文件」一致。分享里本就带前缀的文件不会被叠加（同 applyNamePrefix 的判断）。
+export function buildFileLines(files, { prefix = '' } = {}) {
+  const p = normalizePrefix(prefix);
   return files.map(f => {
     const date = new Date(String(f.updated_at).length <= 10 ? f.updated_at * 1000 : f.updated_at);
-    return `  - ${f.file_name}  (更新于: ${date.toLocaleString('zh-CN')})`;
+    const name = p && !String(f.file_name).startsWith(p) ? `${p}${f.file_name}` : f.file_name;
+    return `  - ${name}  (更新于: ${date.toLocaleString('zh-CN')})`;
   });
 }
 
@@ -1460,7 +1474,7 @@ async function syncInternal(config, opts = {}) {
     const passcode = password || config.password || '';
 
     if (shareUrls.length > 1) {
-      log(`\n${'═'.repeat(50)}`);
+      log(`\n${LOG_RULE}`);
       log(`处理第 ${si + 1}/${shareUrls.length} 个分享`);
       log(`分享 ID: ${pwdIds.join(', ')}${shareTip ? `  (前缀: ${shareTip})` : ''}`);
     } else {
@@ -1541,17 +1555,18 @@ async function syncInternal(config, opts = {}) {
       }
 
       // 试运行：不在这里打印（进度已静音），改为收集起来，函数末尾一次性输出
+      // 前缀一并传进去：清单里给的是加完前缀的最终文件名，而不是分享里的原始名
       if (dryRun) {
         dryRunWouldTransfer += newFiles.length;
         dryRunEntries.push({
           label: shareTip || pwdIds[0] || `第 ${si + 1} 个分享`,
-          lines: buildFileLines(newFiles),
+          lines: buildFileLines(newFiles, { prefix: shareTip }),
         });
         continue;
       }
 
       log('待转存文件列表:');
-      for (const line of buildFileLines(newFiles)) log(line);
+      for (const line of buildFileLines(newFiles, { prefix: shareTip })) log(line);
       log('');
 
       log('4. 开始转存文件到自己的网盘...');
@@ -1584,16 +1599,19 @@ async function syncInternal(config, opts = {}) {
     }
   }
 
-  // 试运行到此为止：上面全程静音，这里只输出「会转存哪些文件」这一件事（错误日志照常输出）
+  // 试运行到此为止：上面全程静音，这里只输出「会转存哪些文件」这一件事（错误日志照常输出）。
+  // 整块用分隔线围起来：紧挨着的都是其它时间点的日志（手动触发、任务完成等），
+  // 不隔开就分不清清单从哪开始、到哪结束。
   if (dryRun) {
+    logAlways(LOG_RULE);
     logAlways('待转存文件列表:');
     if (dryRunEntries.length === 0) {
       logAlways('  （没有需要转存的文件）');
     } else if (dryRunEntries.length === 1) {
-      // 只有一个分享：直接平铺清单，最简洁
+      // 只有一个分享：直接平铺清单（文件名已带上该分享的影视名称），最简洁
       for (const line of dryRunEntries[0].lines) logAlways(line);
     } else {
-      // 多个分享时按分享分组，否则看不出哪个文件来自哪个分享
+      // 多个分享时按分享分组：某个分享没设影视名称时，靠分组才知道文件来自哪
       for (const entry of dryRunEntries) {
         logAlways(`[${entry.label}]`);
         for (const line of entry.lines) logAlways(line);
@@ -1601,6 +1619,7 @@ async function syncInternal(config, opts = {}) {
     }
     logAlways('');
     logAlways(`共 ${dryRunWouldTransfer} 个文件会被转存（试运行，未做任何写入）`);
+    logAlways(LOG_RULE);
     return {
       dryRun: true, wouldTransfer: dryRunWouldTransfer,
       totalSuccess: 0, totalFailed: 0, allSuccess: [], allFailed: [],
@@ -1609,7 +1628,7 @@ async function syncInternal(config, opts = {}) {
   }
 
   if (shareUrls.length > 1) {
-    log(`\n${'═'.repeat(50)}`);
+    log(`\n${LOG_RULE}`);
     log('=== 全部转存结果汇总 ===');
     log(`共处理 ${shareUrls.length} 个分享，成功: ${totalSuccess} 个，失败: ${totalFailed} 个`);
     if (allSuccess.length > 0) {

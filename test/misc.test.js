@@ -1,7 +1,7 @@
-// 重命名序号与 shareUrls 归一化
+// 重命名序号、分享清单行与 shareUrls 归一化
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { withNumericSuffix, normalizeShareUrls } from '../src/index.js';
+import { withNumericSuffix, normalizeShareUrls, normalizePrefix, buildFileLines } from '../src/index.js';
 
 test('withNumericSuffix：序号插在扩展名之前', () => {
   assert.equal(withNumericSuffix('a.mp4', 2), 'a (2).mp4');
@@ -43,4 +43,26 @@ test('normalizeShareUrls：都没有时返回空数组', () => {
 test('normalizeShareUrls：保留备用链接组的数组 url', () => {
   const out = normalizeShareUrls({ shareUrls: [{ url: ['m1', 'm2'], tip: 't' }] });
   assert.deepEqual(out, [{ url: ['m1', 'm2'], tip: 't' }]);
+});
+
+test('normalizePrefix：tip 末尾没有 - 时补一个，已有则不重复补', () => {
+  assert.equal(normalizePrefix('遮天'), '遮天-');
+  assert.equal(normalizePrefix('遮天-'), '遮天-');
+  assert.equal(normalizePrefix(''), '');
+  assert.equal(normalizePrefix(undefined), '');
+});
+
+test('buildFileLines：清单里的文件名是加完影视名称前缀之后的最终名', () => {
+  const files = [{ file_name: '182 4K.mp4', updated_at: 1758538907 }];
+  const [line] = buildFileLines(files, { prefix: '影视名称' });
+  assert.match(line, /^ {2}- 影视名称-182 4K\.mp4 {2}\(更新于: /);
+});
+
+test('buildFileLines：已带前缀不叠加；没设影视名称时保持原名', () => {
+  const one = name => [{ file_name: name, updated_at: 1758538907 }];
+  assert.match(
+    buildFileLines(one('影视名称-182 4K.mp4'), { prefix: '影视名称-' })[0],
+    /- 影视名称-182 4K\.mp4 {2}\(/,
+  );
+  assert.match(buildFileLines(one('182 4K.mp4'))[0], /- 182 4K\.mp4 {2}\(/);
 });
