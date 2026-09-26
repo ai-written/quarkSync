@@ -178,55 +178,270 @@ function writeLog(level, message) {
     lastLogCleanupAt = Date.now();
     cleanupOldLogs();
   }
-  const line = `[${now()}] [${level}] ${message}\n`;
+  // 消息首尾的空行（log('\n' + x) / log(x + '\n') 这类写法）只为在终端里把前后两块分开：
+  // 开头的空行落盘后会把时间戳与级别单独占成一行空记录（读日志时白占一行），结尾的空行
+  // 会在文件里留下空行，所以写文件前一律去掉，时间戳直接落在真正的内容行上；
+  // 去掉后什么都不剩的（log('') 这种纯分隔）干脆不落盘。
+  const ts = now();
+  const text = String(message).replace(/^\n+/, '').replace(/\n+$/, '');
+  // 少数消息自带时间戳（终端输出没有时间戳，只能写在消息里，如 cron 的「触发: …」）；
+  // 行首已有同样的时间戳时把消息里那份去掉，否则文件里会出现 "[时间戳] [INFO] [时间戳] …"
+  const dup = `[${ts}] `;
+  const body = text.startsWith(dup) ? text.slice(dup.length) : text;
+  if (body.trim() === '') return;
+  const line = `[${ts}] [${level}] ${body}\n`;
   try {
     fs.appendFileSync(LOG_FILE, line, 'utf-8');
   } catch {}
 }
 
-export function readLogs({ maxLines = 500, level = '', keyword = '' } = {}) {
+// ---- 日志视图 ----
+// 网页「日志」页默认只看「汇总」：只留总的转存结果汇总（含文件清单）、下载/清理结果与全部报错，
+// 每个分享自己的处理过程整段折叠；需要排查时切到「分享明细」（含每个分享的筛选漏斗）、
+// 「全部日志」（逐行明细），或「登录日志」看谁在什么时候登录过。
+const LOG_VIEWS = ['result', 'summary', 'login', 'all'];
+
+export function normalizeLogView(view) {
+  const v = String(view || '').trim().toLowerCase();
+  return LOG_VIEWS.includes(v) ? v : 'result';
+}
+
+// 「汇总」与「分享明细」两个视图共用这张表：保留任务边界、结果统计、状态变更与文件清单。
+// 「汇总」（result）在此之上再整段丢掉「每个分享自己的处理过程」，见下面的段落判定。
+// 判定以「记录」为单位（一条记录 = 一行带时间戳的日志 + 其后的续行），多行消息不会被截半。
+// 新增日志时，如果它是「一眼就该看到」的结论，把特征补进这张表；拿不准就别加 ——
+// 汇总里多一行只是啰嗦，少一条结论才是问题，所以下面的报错/警告兜底必须保留。
+const SUMMARY_KEEP = [
+  /^=+ .*=+ *$/m,                     // === 任务标题 / 结果汇总分隔线 ===
+  /^═+$/m,                            // ═══ 分隔线：正式运行分隔各分享、试运行围住清单（LOG_RULE）
+  /^\[启动任务\]/m,                    // web 启动后补跑的首次同步、下载
+  /^网页/m,                            // 登录、退出、改配置、手动触发、任务结果
+  /^正在关闭/m,
+  /触发: /m,                           // 定时任务被触发
+  /定时任务已启动/m,
+  /定时任务已按新配置重载/m,
+  /未配置 syncCron/m,
+  /网页管理界面/m,
+  // 启动时回显的 cron（"   ✓ 同步模式: …"）故意不进汇总：「任务」页有带下次运行时间的同一信息，
+  // 每次重启都重复三行纯属噪音
+  /^处理第 \d+\/\d+ 个分享/m,          // 每个分享的边界
+  /^分享 ID: /m,
+  /^时间范围: /m,
+  /✓ 共找到 \d+ 个项目/m,              // 筛选漏斗：从全部条目收敛到待转存
+  /其中文件: \d+ 个/m,
+  /时间窗口内 .*: \d+ 个/m,
+  /过滤 <.*后剩余: \d+ 个/m,
+  /限制每分享最多 \d+ 个/m,
+  /→ 候选文件: \d+ 个/m,
+  /跳过 \d+ 个已存在的文件/m,
+  /→ 需要转存: \d+ 个/m,
+  /没有找到符合条件的文件/m,
+  /所有文件已存在，无需转存/m,
+  /所有文件已下载过，无需下载/m,
+  /待转存文件列表:/m,                  // 试运行清单
+  /会被转存/m,
+  /^\s+- .+\(更新于: /m,               // 试运行清单里的文件名
+  /^\[[^\[\]]+\]\s*$/m,                // 试运行清单里的分享分组标题
+  /^成功: \d+ 个/m,
+  /^失败: \d+ 个/m,
+  /成功转存的文件(列表)?:/m,
+  /失败的文件(列表)?:/m,
+  /已下载的文件列表:/m,
+  /共处理 \d+ 个分享/m,
+  /同步完成: /m,
+  /下载完成: \d+/m,
+  /待下载: \d+/m,
+  /✓ 共 \d+ 个文件/m,
+  /清理网盘旧文件/m,
+  /✓ 网盘清理完成/m,
+  /没有超过保留期的文件/m,
+  /✓ 删除完成/m,
+  /从网盘中删除已下载的/m,
+  /已从配置中清理/m,
+  /失效的分享链接/m,
+  /pruneDeadShares/m,
+  /^执行清理 \(/m,
+  /执行本地清理/m,
+  /本地: 删除 \d+ 个/m,
+  /^AList: /m,
+  /^路径: /m,
+  /保存到: /m,
+  /AList下载完成/m,
+  // 清单里的文件名（逐行 "  ✓ 片名 S01E01.mkv"）；重命名结果行带箭头，属于明细不保留
+  /^\s*✓\s+(?!.*→).*\.\w{2,5}\s*$/m,
+];
+
+// 「登录」视图：网页登录 / 退出，以及夸克登录态校验相关的记录
+const LOGIN_KEEP = [
+  /网页登录/m,
+  /网页退出/m,
+  /登录状态/m,
+  /登录失败/m,
+  /Cookie 无效或已过期/m,
+];
+
+// 汇总视图是热路径（每条记录都要判一次），把整张表合成一个正则，避免逐条试 50 多个模式。
+// 注意：合成后捕获组会统一编号，所以这里新增的模式不要写反向引用（\1 之类），
+// 需要「与」逻辑就单独在 logRecordKeeps 里判（例如文件清单排除带箭头的重命名行）。
+const SUMMARY_RE = new RegExp(SUMMARY_KEEP.map(r => r.source).join('|'), 'm');
+
+// 记录里的「[时间戳] [级别]」前缀只出现在首行，去掉它，^ 锚点才表示「消息自身的开头」。
+// 写日志的格式固定为「[时间戳] [级别] 消息」，因此这里只吃掉分隔用的那一个空格：
+// 用 \s* 会把消息自己的缩进（"   ✓ …" 前导空格）也一起吃掉，缩进是消息的一部分。
+// 续行是消息正文，不能动：试运行清单的分组标题就长成 "[影视名称]"
+function stripLogPrefix(text) {
+  const nl = text.indexOf('\n');
+  const first = nl === -1 ? text : text.slice(0, nl);
+  const rest = nl === -1 ? '' : text.slice(nl);
+  return first.replace(/^\[[^\]]*\] (?:\[[A-Z]+\] )?/, '') + rest;
+}
+
+// 一条日志记录（可含续行，首行带 [时间戳] [级别] 前缀）在指定视图下是否保留。
+// section 是 logSections 算出来的段落（只有「汇总」视图用得上）。
+// 导出仅为测试用。
+export function logRecordKeeps(recordText, view, section = 'other') {
+  const v = normalizeLogView(view);
+  if (v === 'all') return true;
+  const text = stripLogPrefix(recordText);
+  if (v === 'login') return LOGIN_KEEP.some(re => re.test(text));
+  // 汇总可以少，但不能把问题藏起来：报错与警告一律保留（含 INFO 级别里的 ✗ / ⚠）
+  if (/\[ERROR\]/.test(recordText) || /✗|⚠/.test(recordText)) return true;
+  // 「汇总」只看总结果：某个分享自己的处理过程（筛选漏斗、本分享转存结果）整段不要
+  if (v === 'result' && section === 'share') return false;
+  return SUMMARY_RE.test(text);
+}
+
+// ---- 「汇总」视图的段落判定 ----
+// 「哪个分享的日志」这个信息不在单条记录里，得按顺序扫一遍：
+// 分享段从「处理第 N/M 个分享」或「分享 ID:」开始（单分享时没有前者），
+// 到「=== 全部转存结果汇总 ===」为止（单分享时是「同步完成: 成功 X 失败 Y」）。
+const SHARE_SECTION_START = /^处理第 \d+\/\d+ 个分享|^分享 ID: /m;
+const AGGREGATE_SECTION_START = /^=== 全部转存结果汇总 ===|^\s*同步完成: 成功 \d+ 失败 \d+/m;
+
+function sectionOf(text, current) {
+  if (AGGREGATE_SECTION_START.test(text)) return 'aggregate';
+  if (SHARE_SECTION_START.test(text)) return 'share';
+  return current;
+}
+
+const RULE_ONLY = /^═+$/m;
+
+// 逐条给出段落：'share'（某个分享的处理过程）/ 'aggregate'（总结果）/ 'other'（任务边界、下载、清理等）。
+// 分隔线本身不含信息，跟着它后面那条记录走：分享前的线随分享折叠，汇总前的线随汇总保留。
+// 导出仅为测试用。
+export function logSections(recordTexts) {
+  const texts = recordTexts.map(stripLogPrefix);
+  const n = texts.length;
+  // 「后面最近的一条非分隔线记录」先从后往前一趟算好：日志可能有几十万条，
+  // 每条分隔线都重新往后扫一遍就成了 O(n²)
+  const nextContent = new Array(n);
+  let last;
+  for (let i = n - 1; i >= 0; i--) {
+    nextContent[i] = last;
+    if (!RULE_ONLY.test(texts[i])) last = texts[i];
+  }
+  const out = new Array(n);
+  let cur = 'other';
+  for (let i = 0; i < n; i++) {
+    if (RULE_ONLY.test(texts[i])) {
+      const next = nextContent[i];
+      out[i] = next === undefined ? cur : sectionOf(next, cur);
+      continue;
+    }
+    cur = sectionOf(texts[i], cur);
+    out[i] = cur;
+  }
+  return out;
+}
+
+// 从尾部取记录凑够 want 行；以整条记录为单位，不把多行消息截成半截
+function tailRecords(groups, want) {
+  let start = groups.length;
+  let total = 0;
+  while (start > 0) {
+    const len = groups[start - 1].lines.length;
+    if (total > 0 && total + len > want) break;
+    start--;
+    total += len;
+    if (total >= want) break;
+  }
+  const lines = [];
+  for (let i = start; i < groups.length; i++) lines.push(...groups[i].lines);
+  return { lines, dropped: start > 0 };
+}
+
+// file 只给测试用，默认读写项目根目录的 sync.log
+export function readLogs({ maxLines = 500, level = '', keyword = '', view = '', file = LOG_FILE } = {}) {
   const want = Math.max(1, Math.min(5000, Number(maxLines) || 500));
-  if (!fs.existsSync(LOG_FILE)) return { lines: [], truncated: false };
+  const v = normalizeLogView(view);
+  if (!fs.existsSync(file)) return { lines: [], truncated: false, view: v, folded: 0 };
 
   const needle = String(keyword || '').toLowerCase();
   const lvl = String(level || '').toUpperCase();
-  const match = l => {
-    if (lvl && !l.includes(`[${lvl}]`)) return false;
-    if (needle && !l.toLowerCase().includes(needle)) return false;
+
+  // 级别与关键字按整条记录匹配：命中续行时整条记录都在，不会只剩一行没有上下文的标题
+  const passFilters = g => {
+    const text = g.lines.join('\n');
+    if (lvl && !text.toUpperCase().includes(`[${lvl}]`)) return false;
+    if (needle && !text.toLowerCase().includes(needle)) return false;
     return true;
   };
 
+  // 切成记录 -> 套「级别/关键字」与「视图」两层过滤，并统计被视图折叠掉的行数
+  const select = lines => {
+    const { groups, orphan } = groupLogRecords(lines);
+    const all = orphan.length > 0 ? [{ lines: orphan }, ...groups] : groups;
+    const texts = all.map(g => g.lines.join('\n'));
+    // 段落要在「级别/关键字」过滤之前算好：否则被过滤掉的「处理第 N/M 个分享」
+    // 会让后面的分享日志被误判成总结果段
+    const sections = v === 'result' ? logSections(texts) : null;
+    const kept = [];
+    let folded = 0;
+    for (let i = 0; i < all.length; i++) {
+      if (!passFilters(all[i])) continue;
+      if (logRecordKeeps(texts[i], v, sections ? sections[i] : 'other')) kept.push(all[i]);
+      else folded += all[i].lines.length;
+    }
+    return { kept, folded };
+  };
+
+  const finish = (picked, reachedStart) => {
+    const { lines, dropped } = tailRecords(picked.kept, want);
+    return {
+      lines,
+      // 两种截断：尾部取够 want 行后丢弃了更早的记录；或还没扫到文件开头
+      truncated: dropped || !reachedStart,
+      view: v,
+      folded: picked.folded,
+    };
+  };
+
   const fileSize = (() => {
-    try { return fs.statSync(LOG_FILE).size; } catch { return 0; }
+    try { return fs.statSync(file).size; } catch { return 0; }
   })();
 
   // 小文件直接整体读取，避免多次系统调用
   if (fileSize <= SMALL_LOG_BYTES) {
-    const all = tailRawLines(LOG_FILE, fileSize + 1);
-    const matched = all.lines.filter(match);
-    return { lines: matched.slice(-want), truncated: matched.length > want };
+    return finish(select(tailRawLines(file, fileSize + 1).lines), true);
   }
 
   // 大文件：从尾部按窗口渐进放大，窗口上限受字节数约束（而非行数），
-  // 保证最坏情况下的读取量有界
+  // 保证最坏情况下的读取量有界。判断「够了没」要按视图过滤后剩下的行数算，
+  // 否则汇总视图会被一大堆即将折叠的明细行提前喂饱。
   let maxBytes = Math.min(256 * 1024, fileSize);
-  let matched = [];
+  let picked = { kept: [], folded: 0 };
   let reachedStart = false;
   for (let attempt = 0; attempt < 8; attempt++) {
-    const { lines, hitByteCap } = tailRawLines(LOG_FILE, maxBytes);
-    matched = lines.filter(match);
-    // hitByteCap=false 表示已读到头，不可能再有更早的匹配行
+    const { lines, hitByteCap } = tailRawLines(file, maxBytes);
+    picked = select(lines);
+    // hitByteCap=false 表示已读到头，不可能再有更早的匹配记录
     reachedStart = !hitByteCap;
-    if (matched.length >= want || reachedStart) break;
+    const keptLines = picked.kept.reduce((n, g) => n + g.lines.length, 0);
+    if (keptLines >= want || reachedStart) break;
     if (maxBytes >= MAX_LOG_SCAN_BYTES) break;
     maxBytes = Math.min(maxBytes * 4, MAX_LOG_SCAN_BYTES, fileSize);
   }
-
-  return {
-    lines: matched.slice(-want),
-    // 返回行数被截断，或未扫描到文件开头（可能还有更早的匹配行）
-    truncated: matched.length > want || !reachedStart,
-  };
+  return finish(picked, reachedStart);
 }
 
 // 试运行的输出只有「会转存哪些文件」，进度类日志（步骤、筛选计数、目录解析等）全部静音。

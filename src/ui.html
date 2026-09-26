@@ -371,6 +371,12 @@
       <div id="logMsg" class="msg"></div>
       <div class="card">
         <div class="filters">
+          <select id="logView" title="默认只看总的转存结果；要看每个分享的过程就切到「分享明细」">
+            <option value="result">汇总</option>
+            <option value="summary">分享明细</option>
+            <option value="all">全部日志</option>
+            <option value="login">登录日志</option>
+          </select>
           <select id="logLevel">
             <option value="">全部级别</option>
             <option value="INFO">INFO</option>
@@ -381,6 +387,8 @@
           <button id="logRefresh" class="primary">刷新</button>
           <label class="hint"><input type="checkbox" id="logAuto"> 自动刷新(5s)</label>
         </div>
+        <p class="hint" style="margin:0 0 10px">「汇总」只留总的转存结果汇总（含文件清单）、下载与清理结果和全部报错；
+          每个分享的筛选过程见「分享明细」，逐行明细见「全部日志」，登录记录见「登录日志」。</p>
         <pre class="logs" id="logBox">加载中…</pre>
         <p class="hint" id="logMeta" style="margin:8px 0 0"></p>
       </div>
@@ -843,24 +851,33 @@ $('saveBtn').onclick = async () => {
 
 // ---------- 日志 ----------
 let logTimer = null;
+// 视图：默认「汇总」，只显示总的转存结果；具体保留哪些由后端统一判定（见 src/index.js 的 SUMMARY_KEEP）
+const LOG_VIEW_LABEL = { result: '汇总视图', summary: '分享明细视图', all: '全部日志', login: '登录日志' };
 async function loadLogs() {
+  const view = $('logView').value;
   const q = new URLSearchParams({
+    view,
     lines: $('logLines').value || '500',
     level: $('logLevel').value,
     keyword: $('logKeyword').value.trim(),
   });
   try {
     const d = await api('GET', '/api/logs?' + q);
-    $('logBox').textContent = d.lines.length ? d.lines.join('\n') : '（暂无匹配日志）';
-    $('logMeta').textContent = '显示 ' + d.lines.length + ' 行'
-      + (d.truncated ? '（结果过多已截断，可缩小范围）' : '')
-      + ' · ' + new Date().toLocaleTimeString('zh-CN');
+    if (d.lines.length) $('logBox').textContent = d.lines.join('\n');
+    else if (d.view === 'all' || d.view === 'login') $('logBox').textContent = '（暂无匹配日志）';
+    else $('logBox').textContent = '（当前视图下没有匹配记录，可切到「全部日志」再试）';
+    const meta = [LOG_VIEW_LABEL[d.view] || '日志', '显示 ' + d.lines.length + ' 行'];
+    if (d.folded) meta.push('已折叠 ' + d.folded + ' 行明细');
+    if (d.truncated) meta.push('结果过多已截断，可缩小范围');
+    meta.push(new Date().toLocaleTimeString('zh-CN'));
+    $('logMeta').textContent = meta.join(' · ');
     $('logBox').scrollTop = $('logBox').scrollHeight;
   } catch (e) {
     $('logBox').textContent = '加载失败：' + e.message;
   }
 }
 $('logRefresh').onclick = loadLogs;
+$('logView').onchange = loadLogs;
 $('logLevel').onchange = loadLogs;
 $('logKeyword').addEventListener('keydown', e => { if (e.key === 'Enter') loadLogs(); });
 $('logAuto').onchange = () => {

@@ -50,6 +50,15 @@ function parseCookies(header) {
   return out;
 }
 
+// 登录日志带上来源 IP：网页「登录日志」视图要能回答「谁在什么时候登录过」。
+// 反代场景取 X-Forwarded-For 的第一段（最近一跳）；该头部由客户端可控，
+// 因此只保留字符集安全的短字符串，避免把任意内容（甚至换行）写进日志。
+function clientIp(req) {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const cleaned = (fwd || req.socket.remoteAddress || '').replace(/[^0-9a-fA-F:.]/g, '').slice(0, 45);
+  return cleaned || 'unknown';
+}
+
 function createSession() {
   const sid = crypto.randomBytes(32).toString('hex');
   sessions.set(sid, Date.now() + SESSION_TTL_MS);
@@ -335,8 +344,9 @@ function createServer() {
           sendJson(res, 503, { error: '未配置 webToken，网页功能已禁用' });
           return;
         }
+        const ip = clientIp(req);
         if (!body.token || !safeEqual(body.token, token)) {
-          logError('网页登录失败：Token 不正确');
+          logError(`网页登录失败：Token 不正确 (来自 ${ip})`);
           sendJson(res, 401, { error: 'Token 不正确' });
           return;
         }
@@ -347,13 +357,14 @@ function createServer() {
           'Cache-Control': 'no-store',
         });
         res.end(JSON.stringify({ ok: true }));
-        log('网页登录成功');
+        log(`网页登录成功 (来自 ${ip})`);
         return;
       }
 
       if (p === '/api/logout' && req.method === 'POST') {
         const sid = parseCookies(req.headers.cookie)[COOKIE_NAME];
-        if (sid) sessions.delete(sid);
+        // 只记「真的退掉了一个会话」：否则没有会话的裸请求也能刷出一堆退出日志
+        if (sid && sessions.delete(sid)) log(`网页退出登录 (来自 ${clientIp(req)})`);
         res.writeHead(200, {
           'Content-Type': 'application/json; charset=utf-8',
           'Set-Cookie': `${COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`,
@@ -426,6 +437,8 @@ function createServer() {
           maxLines: url.searchParams.get('lines') || 500,
           level: url.searchParams.get('level') || '',
           keyword: url.searchParams.get('keyword') || '',
+          // 不传或传了无法识别的值都按「汇总」处理：默认只给关键记录
+          view: url.searchParams.get('view') || '',
         });
         sendJson(res, 200, result);
         return;
