@@ -14,6 +14,8 @@
     "schedule": "node src/index.js schedule",
     "web": "node src/index.js web",
     "sync-dry": "node src/index.js --dry-run",
+    "dedupe": "node src/index.js dedupe",
+    "dedupe-apply": "node src/index.js dedupe --yes",
     "test": "node --test",
     "docker:build": "node scripts/docker-build.mjs",
     "docker:build:local": "node scripts/docker-build.mjs --no-push --platform linux/amd64"

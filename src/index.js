@@ -196,8 +196,9 @@ function writeLog(level, message) {
 }
 
 // ---- 日志视图 ----
-// 网页「日志」页默认只看「汇总」：只留总的转存结果汇总（含文件清单）、下载/清理结果与全部报错，
-// 每个分享自己的处理过程整段折叠；需要排查时切到「分享明细」（含每个分享的筛选漏斗）、
+// 网页「日志」页默认只看「下载清单」（view=result）：只留下载任务的结果与「已下载的文件列表」，
+// 其它日志一概不显示 —— 包括报错，因为这是一个「只看下载了什么」的视图；
+// 需要排查时切到「分享明细」（关键结论＋每个分享的筛选漏斗＋全部报错）、
 // 「全部日志」（逐行明细），或「登录日志」看谁在什么时候登录过。
 const LOG_VIEWS = ['result', 'summary', 'login', 'all'];
 
@@ -206,11 +207,28 @@ export function normalizeLogView(view) {
   return LOG_VIEWS.includes(v) ? v : 'result';
 }
 
-// 「汇总」与「分享明细」两个视图共用这张表：保留任务边界、结果统计、状态变更与文件清单。
-// 「汇总」（result）在此之上再整段丢掉「每个分享自己的处理过程」，见下面的段落判定。
+// 「下载清单」（result，默认视图）的保留清单：只认下载任务的结果与「已下载的文件列表」。
+// 这张表刻意保持极小：它是一个「只看下载了什么」的视图，其它日志（含报错与警告）一律不显示。
+// 清单里的文件名不是靠这张表认出来的 —— 转存结果清单的文件行长得一模一样、缩进也一样，
+// 只能靠「是否紧跟在本清单标题之后」判断，见下面的 downloadListFlags。
+const DOWNLOAD_KEEP = [
+  /^\s*待下载: \d+/m,                  // 待下载: 5 个 (跳过 1 个已下载记录)
+  /^\s*下载完成: \d+/m,                // 下载完成: 3/5 个
+  /^\s*所有文件已下载过，无需下载/m,
+  /^\s*已下载的文件列表:/m,
+  // 清理重复副本的结果也放这里：这是用户点了按钮之后唯一会看的地方，
+  // 删了什么、失败了没有，都必须在默认视图里看得见（细节仍可用「全部日志」翻）
+  /^=+ .*(清理重复副本|重复副本清理).*=+ *$/m,
+  /^\s*扫描 \d+ 个文件，发现 \d+ 组重复/m,
+  /^\s*(将删除|🗑 删除) \d+ 个，保留 /m,   // 整组是一条多行记录，清单里的文件名跟着一起留
+  /^\s*(已删除|待删除) \d+ 个重复副本/m,
+  /^\s*✗ (云端|本地)(清理|删除|重命名)失败/m,   // 删除失败必须让人看到，不能悄悄消失
+];
+
+// 「分享明细」（summary）的保留清单：任务边界、结果统计、状态变更、文件清单与筛选漏斗。
 // 判定以「记录」为单位（一条记录 = 一行带时间戳的日志 + 其后的续行），多行消息不会被截半。
 // 新增日志时，如果它是「一眼就该看到」的结论，把特征补进这张表；拿不准就别加 ——
-// 汇总里多一行只是啰嗦，少一条结论才是问题，所以下面的报错/警告兜底必须保留。
+// 多一行只是啰嗦，少一条结论才是问题，所以下面的报错/警告兜底必须保留。
 const SUMMARY_KEEP = [
   /^=+ .*=+ *$/m,                     // === 任务标题 / 结果汇总分隔线 ===
   /^═+$/m,                            // ═══ 分隔线：正式运行分隔各分享、试运行围住清单（LOG_RULE）
@@ -222,7 +240,7 @@ const SUMMARY_KEEP = [
   /定时任务已按新配置重载/m,
   /未配置 syncCron/m,
   /网页管理界面/m,
-  // 启动时回显的 cron（"   ✓ 同步模式: …"）故意不进汇总：「任务」页有带下次运行时间的同一信息，
+  // 启动时回显的 cron（"   ✓ 同步模式: …"）故意不进「分享明细」：「任务」页有带下次运行时间的同一信息，
   // 每次重启都重复三行纯属噪音
   /^处理第 \d+\/\d+ 个分享/m,          // 每个分享的边界
   /^分享 ID: /m,
@@ -280,10 +298,11 @@ const LOGIN_KEEP = [
   /Cookie 无效或已过期/m,
 ];
 
-// 汇总视图是热路径（每条记录都要判一次），把整张表合成一个正则，避免逐条试 50 多个模式。
+// 两个视图都是热路径（每条记录都要判一次），各自把整张表合成一个正则，避免逐条试几十个模式。
 // 注意：合成后捕获组会统一编号，所以这里新增的模式不要写反向引用（\1 之类），
 // 需要「与」逻辑就单独在 logRecordKeeps 里判（例如文件清单排除带箭头的重命名行）。
 const SUMMARY_RE = new RegExp(SUMMARY_KEEP.map(r => r.source).join('|'), 'm');
+const DOWNLOAD_RE = new RegExp(DOWNLOAD_KEEP.map(r => r.source).join('|'), 'm');
 
 // 记录里的「[时间戳] [级别]」前缀只出现在首行，去掉它，^ 锚点才表示「消息自身的开头」。
 // 写日志的格式固定为「[时间戳] [级别] 消息」，因此这里只吃掉分隔用的那一个空格：
@@ -297,59 +316,39 @@ function stripLogPrefix(text) {
 }
 
 // 一条日志记录（可含续行，首行带 [时间戳] [级别] 前缀）在指定视图下是否保留。
-// section 是 logSections 算出来的段落（只有「汇总」视图用得上）。
+// inDownloadList 是 downloadListFlags 算出来的「属于已下载的文件列表」标记（只有「下载清单」视图用得上）。
 // 导出仅为测试用。
-export function logRecordKeeps(recordText, view, section = 'other') {
+export function logRecordKeeps(recordText, view, inDownloadList = false) {
   const v = normalizeLogView(view);
   if (v === 'all') return true;
   const text = stripLogPrefix(recordText);
   if (v === 'login') return LOGIN_KEEP.some(re => re.test(text));
-  // 汇总可以少，但不能把问题藏起来：报错与警告一律保留（含 INFO 级别里的 ✗ / ⚠）
+  // 「下载清单」只看下载了什么：报错也不显示（要找问题请切「分享明细」或「全部日志」）；
+  // 带箭头的重命名行属于明细，即便落在清单块里也不显示
+  if (v === 'result') return (inDownloadList && !/→/.test(text)) || DOWNLOAD_RE.test(text);
+  // 「分享明细」可以少，但不能把问题藏起来：报错与警告一律保留（含 INFO 级别里的 ✗ / ⚠）
   if (/\[ERROR\]/.test(recordText) || /✗|⚠/.test(recordText)) return true;
-  // 「汇总」只看总结果：某个分享自己的处理过程（筛选漏斗、本分享转存结果）整段不要
-  if (v === 'result' && section === 'share') return false;
   return SUMMARY_RE.test(text);
 }
 
-// ---- 「汇总」视图的段落判定 ----
-// 「哪个分享的日志」这个信息不在单条记录里，得按顺序扫一遍：
-// 分享段从「处理第 N/M 个分享」或「分享 ID:」开始（单分享时没有前者），
-// 到「=== 全部转存结果汇总 ===」为止（单分享时是「同步完成: 成功 X 失败 Y」）。
-const SHARE_SECTION_START = /^处理第 \d+\/\d+ 个分享|^分享 ID: /m;
-const AGGREGATE_SECTION_START = /^=== 全部转存结果汇总 ===|^\s*同步完成: 成功 \d+ 失败 \d+/m;
+// ---- 「下载清单」视图的清单归属判定 ----
+// 「已下载的文件列表:」标题之后的 ✓ 文件名行才算这份清单。为什么不直接把文件名写进
+// DOWNLOAD_KEEP：转存结果清单（「成功转存的文件列表:」下的行）格式与缩进完全一样，
+// 单看一行分不出它属于哪份清单，只能按位置认。
+// 清单块到第一条非文件名记录为止（下载完接着是删除结果之类），后面的清单不会被前面的块认领。
+const DOWNLOAD_LIST_HEAD = /^\s*已下载的文件列表:/m;
+const LIST_FILE_LINE = /^\s*✓\s+(?!.*→).*\.\w{2,5}\s*$/m;
 
-function sectionOf(text, current) {
-  if (AGGREGATE_SECTION_START.test(text)) return 'aggregate';
-  if (SHARE_SECTION_START.test(text)) return 'share';
-  return current;
-}
-
-const RULE_ONLY = /^═+$/m;
-
-// 逐条给出段落：'share'（某个分享的处理过程）/ 'aggregate'（总结果）/ 'other'（任务边界、下载、清理等）。
-// 分隔线本身不含信息，跟着它后面那条记录走：分享前的线随分享折叠，汇总前的线随汇总保留。
+// 逐条给出「是否属于已下载的文件列表」：标题行与块内的文件名行为 true。
 // 导出仅为测试用。
-export function logSections(recordTexts) {
-  const texts = recordTexts.map(stripLogPrefix);
-  const n = texts.length;
-  // 「后面最近的一条非分隔线记录」先从后往前一趟算好：日志可能有几十万条，
-  // 每条分隔线都重新往后扫一遍就成了 O(n²)
-  const nextContent = new Array(n);
-  let last;
-  for (let i = n - 1; i >= 0; i--) {
-    nextContent[i] = last;
-    if (!RULE_ONLY.test(texts[i])) last = texts[i];
-  }
-  const out = new Array(n);
-  let cur = 'other';
-  for (let i = 0; i < n; i++) {
-    if (RULE_ONLY.test(texts[i])) {
-      const next = nextContent[i];
-      out[i] = next === undefined ? cur : sectionOf(next, cur);
-      continue;
-    }
-    cur = sectionOf(texts[i], cur);
-    out[i] = cur;
+export function downloadListFlags(recordTexts) {
+  const out = new Array(recordTexts.length).fill(false);
+  let inList = false;
+  for (let i = 0; i < recordTexts.length; i++) {
+    const text = stripLogPrefix(recordTexts[i]);
+    if (DOWNLOAD_LIST_HEAD.test(text)) { inList = true; out[i] = true; continue; }
+    if (inList && LIST_FILE_LINE.test(text)) { out[i] = true; continue; }
+    inList = false;
   }
   return out;
 }
@@ -392,14 +391,13 @@ export function readLogs({ maxLines = 500, level = '', keyword = '', view = '', 
     const { groups, orphan } = groupLogRecords(lines);
     const all = orphan.length > 0 ? [{ lines: orphan }, ...groups] : groups;
     const texts = all.map(g => g.lines.join('\n'));
-    // 段落要在「级别/关键字」过滤之前算好：否则被过滤掉的「处理第 N/M 个分享」
-    // 会让后面的分享日志被误判成总结果段
-    const sections = v === 'result' ? logSections(texts) : null;
+    // 清单归属要在「级别/关键字」过滤之前算好：标题行被关键字挡掉时，块内的文件名仍要认得出
+    const dlist = v === 'result' ? downloadListFlags(texts) : null;
     const kept = [];
     let folded = 0;
     for (let i = 0; i < all.length; i++) {
       if (!passFilters(all[i])) continue;
-      if (logRecordKeeps(texts[i], v, sections ? sections[i] : 'other')) kept.push(all[i]);
+      if (logRecordKeeps(texts[i], v, dlist ? dlist[i] : false)) kept.push(all[i]);
       else folded += all[i].lines.length;
     }
     return { kept, folded };
@@ -427,7 +425,7 @@ export function readLogs({ maxLines = 500, level = '', keyword = '', view = '', 
 
   // 大文件：从尾部按窗口渐进放大，窗口上限受字节数约束（而非行数），
   // 保证最坏情况下的读取量有界。判断「够了没」要按视图过滤后剩下的行数算，
-  // 否则汇总视图会被一大堆即将折叠的明细行提前喂饱。
+  // 否则下载清单视图会被一大堆即将折叠的明细行提前喂饱。
   let maxBytes = Math.min(256 * 1024, fileSize);
   let picked = { kept: [], folded: 0 };
   let reachedStart = false;
@@ -728,27 +726,51 @@ async function tryShareUrls(client, pwdIds, passcode, tip, deadSet) {
   return null;
 }
 
-export function parseEpisode(fileName) {
-  const name = fileName.replace(/\.[^.]+$/, '');
+// 去掉「 (2)」「（3）」这类为避免重名自动加的序号后缀（只认扩展名前的 2..999）。
+// 序号副本与原始文件是同一份内容，比对集数前必须先归一化，否则会被当成两集，
+// 于是「同名集去重」永远合并不掉，下载与清理都看不出它们是重复的。
+export function stripNumericSuffix(fileName) {
+  const s = String(fileName ?? '');
+  const dot = s.lastIndexOf('.');
+  const base = dot > 0 ? s.slice(0, dot) : s;
+  const ext = dot > 0 ? s.slice(dot) : '';
+  const m = base.match(/^(.*?)[\s]*[（(](\d{1,3})[)）]$/);
+  if (!m) return s;
+  const n = Number(m[2]);
+  if (n < 2) return s;   // (0)/(1) 不当作自动序号，避免误改正常名字
+  return `${m[1].replace(/\s+$/, '')}${ext}`;
+}
+
+// parseEpisode 的内部版本：额外给出「季号是不是明确写出来的」。
+// 灵境行者-S01E07.mkv（季 1）与 灵境行者-07.mkv（没写季）是同一集，可以合并；
+// 但 第1季第7集 与 第2季第7集 不是同一集 —— 只有知道季号是否明确，才能安全地合并。
+function parseEpisodeInfo(fileName) {
+  const name = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
   let m;
 
   m = name.match(/[Ss](\d+)\s*[Ee](?:\s*P\s*)?(\d+)/);
-  if (m) return { season: +m[1], episode: +m[2] };
+  if (m) return { season: +m[1], episode: +m[2], seasonKnown: true };
 
   m = name.match(/第?\s*(\d+)\s*季.*?第?\s*(\d+)\s*集/);
-  if (m) return { season: +m[1], episode: +m[2] };
+  if (m) return { season: +m[1], episode: +m[2], seasonKnown: true };
 
   m = name.match(/第?\s*(\d+)\s*集/);
-  if (m) return { season: 0, episode: +m[1] };
+  if (m) return { season: 0, episode: +m[1], seasonKnown: false };
 
   const nums = [...name.matchAll(/(\d+)/g)].map(n => +n[1]);
   const nonYear = nums.filter(n => n < 1900 || n > 2099);
   if (nonYear.length > 0) {
     const best = nonYear.reduce((a, b) => String(a).length >= String(b).length ? a : b);
-    return { season: 0, episode: best };
+    return { season: 0, episode: best, seasonKnown: false };
   }
 
   return null;
+}
+
+export function parseEpisode(fileName) {
+  const info = parseEpisodeInfo(fileName);
+  if (!info) return null;
+  return { season: info.season, episode: info.episode };
 }
 
 export function sortByEpisode(a, b) {
@@ -763,18 +785,47 @@ export function sortByEpisode(a, b) {
   return (b.updated_at || 0) - (a.updated_at || 0);
 }
 
-export function getEpisodeKey(fileName) {
-  const ep = parseEpisode(fileName);
-  if (!ep) return null;
-  const name = fileName.replace(/\.[^.]+$/, '');
-  let show = name;
+// 从文件名里剥出「剧名」：去掉季集标记、画质/编码等噪音与结尾的集数。
+// hdr 必须排在 hd 前面，否则 "HDR" 会被 hd 咬掉一块、留下 "R" 这种残渣，
+// 于是「择日飞升-14 4K HDR.mp4」与「择日飞升-14 4K.mp4」会被当成两部剧。
+function episodeShow(fileName) {
+  let show = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
   show = show.replace(/[-_\s]*[Ss]\d+[-\s]*[Ee]\d+.*$/, '');
   show = show.replace(/[-_\s]*第?\s*\d+\s*季.*$/, '');
   show = show.replace(/[-_\s]*第?\s*\d+\s*集.*$/, '');
-  show = show.replace(/(4k|2160p|1080p|720p|高清|标清|hd|fhd|uhd|sd)/gi, '');
+  show = show.replace(/(hdr10\+?|hdr|dolby\s*vision|4k|2160p|1080p|720p|高清|标清|hd|fhd|uhd|sd)/gi, '');
   show = show.replace(/[-_\s]*\d+\s*$/, '');
   show = show.replace(/[-_\s]+$/, '').trim();
-  return `ep_${show}_S${ep.season}_E${ep.episode}`;
+  return show;
+}
+
+// 严格键：季号参与区分（S01E07 与 S02E07 是两个键）。.downloaded.json 用它，
+// 所以不能把季号抹掉，否则升级后旧记录全部失配、触发全量重下。
+export function getEpisodeKey(fileName) {
+  const info = parseEpisodeInfo(fileName);
+  if (!info) return null;
+  return `ep_${episodeShow(fileName)}_S${info.season}_E${info.episode}`;
+}
+
+// 仅用于「同一集」分组的剧名：把分隔符与大小写归一化。
+// 场景命名混用时（Show.S01E07.mkv / Show-07.mkv）剧名会差一个分隔符，
+// 归一化后才能认出它们同属一部剧。
+// 注意只有分组用它；getEpisodeKey 的剧名保持原样 —— 那是 .downloaded.json 的记录键，
+// 改动会让升级前的记录全部失配、触发全量重下。
+function episodeShowLoose(fileName) {
+  return episodeShow(fileName).replace(/[.\-_\s]+/g, '').toLowerCase();
+}
+
+// 宽松分组信息：loose 忽略季号，season 是明确季号（没写季号时为 null）。
+// 「同一集」的判定都建立在它之上，见 groupByEpisode。
+// 导出仅为测试用。
+export function getEpisodeGroup(fileName) {
+  const info = parseEpisodeInfo(fileName);
+  if (!info) return null;
+  return {
+    loose: `ep_${episodeShowLoose(fileName)}_E${info.episode}`,
+    season: info.seasonKnown ? info.season : null,
+  };
 }
 
 const QUALITY_SCORE = { '4k': 5, '2160p': 4, 'uhd': 4, '1080p': 3, 'fhd': 3, '1080': 3, '720p': 2, 'hd': 2, '720': 2, '高清': 2, '标清': 1, 'sd': 1 };
@@ -794,40 +845,121 @@ export function isHigherQuality(aName, aSize, bName, bSize) {
   return (aSize || 0) > (bSize || 0);
 }
 
+// 「留哪一份」的统一规则：画质高的优先，其次体积大的，再次名字没被加过序号的
+// （避免只留下 凡人修仙传-194 4K (4).mkv 这种名字），最后留更新时间更早的那份。
+// 返回负数表示 a 更该保留。去重、下载、清理三处共用同一套规则，结论才不会互相矛盾。
+export function compareForKeep(a, b) {
+  const aName = a.file_name || a.name;
+  const bName = b.file_name || b.name;
+  const aSize = a.size || 0;
+  const bSize = b.size || 0;
+  if (isHigherQuality(aName, aSize, bName, bSize)) return -1;
+  if (isHigherQuality(bName, bSize, aName, aSize)) return 1;
+  // 画质与体积都一样：优先留没被加过序号的名字，再留更新时间更早的那份
+  const na = stripNumericSuffix(aName) === aName ? 0 : 1;
+  const nb = stripNumericSuffix(bName) === bName ? 0 : 1;
+  if (na !== nb) return na - nb;
+  return (a.updated_at || 0) - (b.updated_at || 0);
+}
+
+// 按「同一集」把文件分桶：loose 相同的先放一起，桶内再按明确季号区分。
+// 无法识别集数的文件（电影、特别篇）不进任何桶 —— 它们永远不会被判成重复。
+function collectEpisodeBuckets(files) {
+  const buckets = new Map();
+  for (const f of files) {
+    const info = getEpisodeGroup(f.file_name || f.name);
+    if (!info) continue;
+    if (!buckets.has(info.loose)) buckets.set(info.loose, { known: new Map(), unknown: [] });
+    const b = buckets.get(info.loose);
+    if (info.season === null) {
+      b.unknown.push(f);
+    } else {
+      if (!b.known.has(info.season)) b.known.set(info.season, []);
+      b.known.get(info.season).push(f);
+    }
+  }
+  return buckets;
+}
+
+// 把文件按「同一集」分组，返回 Map<分组键, 文件数组>。规则：
+// - 双方都写了季号：季号不同就是不同集（S01E07 与 S02E07 不会被合并）
+// - 只有一方写了季号：并成同一集（S01E07 与 07 是同一集）
+// - 桶里既有多个明确季号、又有没写季号的：没写季号的无法判断归属，各自独立
+//   —— 宁可漏合（多留一份），也绝不能误合（把另一集当成重复删掉）
+export function groupByEpisode(files) {
+  const out = new Map();
+  for (const [loose, b] of collectEpisodeBuckets(files)) {
+    const seasons = [...b.known.keys()];
+    if (seasons.length === 0) {
+      out.set(`${loose}#?`, b.unknown);
+    } else if (seasons.length === 1) {
+      out.set(`${loose}#S${seasons[0]}`, [...b.known.get(seasons[0]), ...b.unknown]);
+    } else {
+      for (const s of seasons) out.set(`${loose}#S${s}`, b.known.get(s));
+      b.unknown.forEach((f, i) => out.set(`${loose}#?${i}`, [f]));
+    }
+  }
+  return out;
+}
+
+// 目标文件夹的「已有集」索引：loose -> { seasons, unknown }。
+// 与 groupByEpisode 同一套判定，所以「转存时跳过」与「分组去重」不会给出矛盾结论。
+export function buildEpisodeIndex(files) {
+  const index = new Map();
+  for (const [loose, b] of collectEpisodeBuckets(files)) {
+    index.set(loose, { seasons: new Set(b.known.keys()), unknown: b.unknown.length });
+  }
+  return index;
+}
+
+// fileName（带前缀的最终名）在目标文件夹里是否已有同一集。判定与 groupByEpisode 一致：
+// 候选没写季号时，只有桶里明确季号不超过一个才能并；候选写了季号时，桶里有同季号才并。
+export function indexHasSameEpisode(index, fileName) {
+  const info = getEpisodeGroup(fileName);
+  if (!info) return false;
+  const hit = index.get(info.loose);
+  if (!hit) return false;
+  if (info.season === null) return hit.seasons.size <= 1;
+  if (hit.seasons.size === 0) return hit.unknown > 0;
+  return hit.seasons.has(info.season);
+}
+
+// 找出「同一集留了多份」的组合，每组按保留优先级排好序（keep 是最该留的那份）。
+// 云端清理与本地清理都用它；导出仅为测试用，可直接验证挑选结果。
+export function findDuplicateSets(files) {
+  const sets = [];
+  for (const [key, group] of groupByEpisode(files)) {
+    if (group.length < 2) continue;
+    const sorted = [...group].sort(compareForKeep);
+    sets.push({ key, keep: sorted[0], drop: sorted.slice(1) });
+  }
+  return sets;
+}
+
 // 同名集去重：同集保留画质最高的那份（画质相同则取体积更大的）。
+// 与旧版相比，这里能认出「加过序号的副本」（... (2).mkv）与「写/不写季号」的同一集，
+// 因此不会再放着一堆重复文件不管。
 //
 // 这里不直接写日志，而是通过 onSkip 回调交给调用方 —— 保持本函数是纯函数：
 // 单测可以直接调用它，不会把测试输出写进真实的 sync.log。
 export function deduplicateByEpisode(files, { onSkip } = {}) {
-  const groups = new Map();
-  const unkeyed = [];
-  for (const f of files) {
-    const name = f.file_name || f.name;
-    const key = getEpisodeKey(name);
-    if (key) {
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(f);
-    } else {
-      unkeyed.push(f);
-    }
-  }
-  const deduped = [];
+  const kept = new Set();
+  const grouped = new Set();
   let removed = 0;
-  for (const [key, group] of groups) {
-    group.sort((a, b) => {
-      const aName = a.file_name || a.name;
-      const bName = b.file_name || b.name;
-      return isHigherQuality(bName, b.size || 0, aName, a.size || 0) ? 1 : -1;
-    });
-    deduped.push(group[0]);
-    if (group.length > 1) {
-      removed += group.length - 1;
-      if (onSkip) onSkip(`   ⏭ 同名集去重: ${key} (${group.length}个版本, 保留 ${group[0].file_name || group[0].name})`);
+  for (const [key, group] of groupByEpisode(files)) {
+    const sorted = [...group].sort(compareForKeep);
+    for (const f of group) grouped.add(f);
+    kept.add(sorted[0]);
+    if (sorted.length > 1) {
+      removed += sorted.length - 1;
+      const dropped = sorted.slice(1).map(f => f.file_name || f.name).join(', ');
+      if (onSkip) onSkip(`   ⏭ 同名集去重: ${key} (${sorted.length}个版本, 保留 ${sorted[0].file_name || sorted[0].name}，丢弃 ${dropped})`);
     }
   }
   if (removed > 0 && onSkip) onSkip(`   → 去重移除 ${removed} 个较低画质版本\n`);
-  deduped.push(...unkeyed);
-  return deduped;
+  // 输出保持输入顺序：调用方拿到的顺序与接口返回一致。
+  // 识别不出集数的文件（电影、特别篇）不属于任何分组，原样保留。
+  return files.filter(f => !grouped.has(f) || kept.has(f));
 }
 
 export function getDedupKey(fileItem) {
@@ -1024,14 +1156,18 @@ class QuarkClient {
     return result;
   }
 
-  async getExistingFileMap(pdirFid = '0') {
-    const files = await this.listAllUserFiles(pdirFid);
-    const map = new Map();
-    for (const f of files) {
-      const key = `${f.file_name}|${f.size || ''}`;
-      map.set(key, true);
+  // 只列当层的文件（不递归）。清理重复副本时用它：本项目转存进来的文件都在当层，
+  // 子文件夹里的东西是用户自己放的，不该被当成「重复副本」删掉。
+  async listTopLevelFiles(pdirFid = '0') {
+    const result = [];
+    let page = 1;
+    while (true) {
+      const { list } = await this.listUserFiles(pdirFid, page);
+      for (const f of list) if (!f.dir) result.push(f);
+      if (list.length < 100) break;
+      page++;
     }
-    return map;
+    return result;
   }
 
   async findFolderByName(name, pdirFid = '0') {
@@ -1748,17 +1884,33 @@ async function syncInternal(config, opts = {}) {
 
       log('   检查目标文件夹中已存在的文件...');
       // 试运行且目标文件夹尚不存在时无从比对，视为空目录（正式运行时它会是新建的空目录）
-      const existingMap = targetDirFid ? await client.getExistingFileMap(targetDirFid) : new Map();
+      const existingFiles = targetDirFid ? await client.listAllUserFiles(targetDirFid) : [];
+      const existingMap = new Map(existingFiles.map(f => [`${f.file_name}|${f.size || ''}`, true]));
+      // 「同一集是否已经转过」的索引：只看文件名，不看体积。
+      // 只按「名称|大小」比对时，上游重新压制/重传（体积差几 MB）或已被加过序号副本的文件
+      // 都会判成「新文件」，于是每跑一次同步就多出 (2)(3)(4)... 一份，永远停不下来。
+      const episodeIndex = buildEpisodeIndex(existingFiles);
+      const dedupEpisodes = config.dedupEpisodesInTarget !== false;
+      const sharePrefix = shareTip ? normalizePrefix(shareTip) : '';
       const newFiles = largeFiles.filter(f => {
         const key = `${f.file_name}|${f.size || ''}`;
         if (existingMap.has(key)) return false;
-        if (shareTip) {
-          const prefix = shareTip.endsWith('-') ? shareTip : `${shareTip}-`;
-          if (existingMap.has(`${prefix}${f.file_name}|${f.size || ''}`)) return false;
+        if (sharePrefix && existingMap.has(`${sharePrefix}${f.file_name}|${f.size || ''}`)) return false;
+        // 最终文件名（加前缀后的那份）与目标文件夹比对：集数相同就不再转存，
+        // 不论体积是否一致、也不论现存那份是不是带序号的副本
+        if (dedupEpisodes) {
+          const finalName = sharePrefix && !String(f.file_name).startsWith(sharePrefix)
+            ? `${sharePrefix}${f.file_name}`
+            : f.file_name;
+          if (indexHasSameEpisode(episodeIndex, finalName)) {
+            log(`   ⏭ 同名集已存在: ${finalName}`);
+            return false;
+          }
         }
         return true;
       });
-      const skipped = recentFiles.length - newFiles.length;
+      // 基数必须是「候选文件」：早先按 recentFiles 算，会把体积过滤掉的文件也算成「已存在」
+      const skipped = largeFiles.length - newFiles.length;
       if (skipped > 0) {
         log(`   ⏭ 跳过 ${skipped} 个已存在的文件`);
       }
@@ -2303,10 +2455,185 @@ async function alistInternal(config) {
   }
 }
 
+// ---- 清理重复副本 ----
+// 同一集在目标文件夹/本地留了多份（历年积累的序号副本、S01E07 与 07 这类不同命名）时，
+// 保留最好的一份、删掉其余。**默认只报告不删除**（apply=false），必须显式要求才动文件：
+// 删除是不可逆的，而分组靠的是文件名启发式，宁可让人先看一眼清单。
+// 「留哪一份」与去重共用 compareForKeep，保证「去重后留下的」与「清理后留下的」是同一份。
+
+// 本地下载目录里的重复：同一集留一份。返回 { sets, kept, deleted }。
+// apply=false 时只统计不删（供预览）。导出仅为测试用。
+export function cleanupLocalDuplicates(saveDir, { apply = false } = {}) {
+  let entries;
+  try {
+    entries = fs.readdirSync(saveDir, { withFileTypes: true });
+  } catch (e) {
+    throw new Error(`无法读取本地目录 ${saveDir}: ${e.message}`);
+  }
+
+  const files = [];
+  for (const e of entries) {
+    // 跳过点文件（.downloaded.json）与下载中的 .part 半成品：半成品体积可能比正常文件
+    // 还大，混进分组会把真正完好的那份当成「多余的」删掉
+    if (!e.isFile() || e.name.startsWith('.') || e.name.endsWith('.part')) continue;
+    const full = path.join(saveDir, e.name);
+    let stat;
+    try { stat = fs.statSync(full); } catch { continue; }
+    files.push({ name: e.name, size: stat.size, updated_at: stat.mtimeMs, full });
+  }
+
+  const sets = findDuplicateSets(files);
+  const deleted = [];
+  const failed = [];
+  for (const s of sets) {
+    for (const f of s.drop) {
+      if (!apply) { deleted.push(f); continue; }
+      try {
+        fs.unlinkSync(f.full);
+        deleted.push(f);
+      } catch (e) {
+        failed.push(`${f.name}: ${e.message}`);
+      }
+    }
+  }
+  return { sets, kept: sets.map(s => s.keep), deleted, failed, scanned: files.length };
+}
+
+// 云端（转存目标文件夹当层）里的重复：同一集留一份。
+async function cleanupCloudDuplicates(client, targetDirFid, { apply = false } = {}) {
+  const files = await client.listTopLevelFiles(targetDirFid);
+  const sets = findDuplicateSets(files);
+  const deleted = [];
+  const renamed = [];
+
+  if (apply) {
+    for (const s of sets) {
+      for (let i = 0; i < s.drop.length; i += 30) {
+        const batch = s.drop.slice(i, i + 30);
+        try {
+          await client.deleteFiles(batch.map(f => f.fid));
+          deleted.push(...batch);
+        } catch (e) {
+          // 用 logError：删失败必须在默认「下载清单」视图里看得见，否则汇总数字对不上却查不到原因
+          logError(`   ✗ 云端删除失败 (${batch[0].file_name} 等 ${batch.length} 个): ${e.message}`);
+        }
+      }
+    }
+    // 删完之后把带序号的赢家改回不带序号的名字（best-effort）：
+    // 否则清理干净了，留下的大头却叫「凡人修仙传-194 4K (4).mkv」
+    const removed = new Set(deleted);
+    const remain = new Set(files.filter(f => !removed.has(f)).map(f => f.file_name));
+    for (const s of sets) {
+      const name = s.keep.file_name;
+      const canonical = stripNumericSuffix(name);
+      if (canonical === name || remain.has(canonical)) continue;
+      try {
+        await client.renameFile(s.keep.fid, canonical);
+        remain.delete(name);
+        remain.add(canonical);
+        renamed.push(`${name} → ${canonical}`);
+      } catch (e) {
+        logError(`   ✗ 云端重命名失败 ${name}: ${e.message}`);
+      }
+    }
+  } else {
+    for (const s of sets) deleted.push(...s.drop);
+  }
+
+  return { sets, kept: sets.map(s => s.keep), deleted, renamed, scanned: files.length };
+}
+
+// 一组重复的清单做成**一条多行记录**：日志视图是按「记录」过滤的，
+// 拆成多条独立记录的话，默认「下载清单」视图里会只剩标题、看不到到底要删哪些文件。
+function dedupeGroupLine(apply, drop, keepName, nameOf) {
+  const lines = drop.map(f => `      ${apply ? '✗' : '·'} ${nameOf(f)}`).join('\n');
+  return `   ${apply ? '🗑 删除' : '将删除'} ${drop.length} 个，保留 ${keepName}\n${lines}`;
+}
+
+// 清理重复：cloud 清网盘目标文件夹（当层），local 清本地下载目录
+async function dedupeInternal(config, { apply = false, cloud = true, local = true } = {}) {
+  log(`=== 清理重复副本${apply ? '' : '（预览，不会删除任何文件）'} ===\n`);
+  let totalDrop = 0;
+
+  if (cloud) {
+    if (!config.cookie) {
+      logError('   ⚠ 未配置 cookie，跳过云端清理');
+    } else {
+      log('1. 检查网盘目标文件夹...');
+      try {
+        const client = new QuarkClient(config.cookie);
+        const nickname = await client.checkLogin();
+        if (!nickname) throw new Error('Cookie 无效或已过期！请重新从浏览器获取 Cookie');
+        // 只查找不创建：文件夹不存在时没有任何东西可清
+        const targetDirFid = await client.resolveTargetDir(config, { dryRun: true });
+        if (targetDirFid === null) {
+          log('   ✓ 目标文件夹不存在，无需清理');
+        } else {
+          if (targetDirFid === '0') {
+            logError('   ⚠ 未配置目标文件夹，将扫描网盘根目录（建议先在配置页填好目标文件夹）');
+          }
+          const r = await cleanupCloudDuplicates(client, targetDirFid, { apply });
+          log(`   扫描 ${r.scanned} 个文件，发现 ${r.sets.length} 组重复，共 ${r.deleted.length} 个多余副本`);
+          for (const s of r.sets) {
+            log(dedupeGroupLine(apply, s.drop, s.keep.file_name, f => f.file_name));
+          }
+          for (const line of r.renamed) log(`   ✓ 已改回不带序号的名字: ${line}`);
+          totalDrop += r.deleted.length;
+        }
+      } catch (e) {
+        logError(`   ✗ 云端清理失败: ${e.message}`);
+      }
+    }
+  }
+
+  if (local) {
+    // 没配 downloadDir 时绝不去扫「.」：那会把项目目录当成下载目录
+    const dir = String(config.downloadDir || '').trim();
+    if (!dir) {
+      logError('\n   ⚠ 未配置 downloadDir，跳过本地清理');
+    } else {
+      const saveDir = path.resolve(dir);
+      log(`\n2. 检查本地目录 ${saveDir}...`);
+      try {
+        const r = cleanupLocalDuplicates(saveDir, { apply });
+        log(`   扫描 ${r.scanned} 个文件，发现 ${r.sets.length} 组重复，共 ${r.deleted.length} 个多余副本`);
+        for (const s of r.sets) {
+          log(dedupeGroupLine(apply, s.drop, s.keep.name, f => f.name));
+        }
+        for (const msg of r.failed) logError(`   ✗ 本地删除失败 ${msg}`);
+        totalDrop += r.deleted.length;
+      } catch (e) {
+        logError(`   ✗ 本地清理失败: ${e.message}`);
+      }
+    }
+  }
+
+  log(`\n${apply ? '已删除' : '待删除'} ${totalDrop} 个重复副本`
+    + (apply ? '' : '（预览模式，加 --yes 或点网页的「执行删除」才会真的删）'));
+  return { apply, total: totalDrop };
+}
+
+// 云端清理动的是同步的目标文件夹，所以外层共用同步任务锁：跨进程也有效（cron 用的是同一把锁），
+// 不会出现一边在删、一边在转存。内层再加一把 dedupe 锁，只为让「任务」页显示的是清理而不是同步。
+export async function runDedupe(config, opts = {}) {
+  return withTaskLock('sync', () => withTaskLock('dedupe', () => dedupeInternal(config ?? loadConfig(), opts)));
+}
+
+async function dedupeMode(apply, opts = {}) {
+  log('=== 夸克网盘重复副本清理 ===\n');
+  const config = loadConfigOrExit();
+  await runDedupe(config, { apply, ...opts });
+  if (!apply) log('\n提示: 确认清单无误后执行删除：npm run dedupe-apply（或 node src/index.js dedupe --yes）\n');
+}
+
 function main() {
   const mode = process.argv[2];
   const forceDownload = process.argv.includes('--force-download') || process.argv.includes('--no-skip');
   const dryRun = process.argv.includes('--dry-run');
+  // 清理重复副本：默认只预览；--yes 才真的删（--dry-run 与默认同为预览）
+  const applyDedupe = process.argv.includes('--yes') && !dryRun;
+  const cloudOnly = process.argv.includes('--cloud-only');
+  const localOnly = process.argv.includes('--local-only');
 
   // --dry-run 目前只实现在同步模式：其他模式若静默忽略它，用户会误以为「没写入」
   const nonSyncModes = ['--download', 'download', '--schedule', 'schedule', '--alist', 'alist', '--web', 'web'];
@@ -2315,7 +2642,12 @@ function main() {
     process.exit(1);
   }
 
-  if (mode === '--download' || mode === 'download') {
+  if (mode === '--dedupe' || mode === 'dedupe') {
+    dedupeMode(applyDedupe, { cloud: !localOnly, local: !cloudOnly }).catch(err => {
+      logError('\n程序异常: ' + err.message);
+      process.exit(1);
+    });
+  } else if (mode === '--download' || mode === 'download') {
     downloadMode(forceDownload).catch(err => {
       logError('\n程序异常: ' + err.message);
       process.exit(1);

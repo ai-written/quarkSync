@@ -12,6 +12,7 @@ import {
   logError,
   runSync,
   runAlist,
+  runDedupe,
   listScheduledTasks,
   registerScheduledTasks,
   getRunningTasks,
@@ -158,6 +159,7 @@ function validateConfig(c) {
   optionalBool('runOnStartup');
   optionalBool('pruneDeadShares');
   optionalBool('downloadAfterSync');
+  optionalBool('dedupEpisodesInTarget');
 
   optionalInt('minFileSizeMB', 0);
   optionalInt('maxFilesPerShare', 0);
@@ -248,10 +250,10 @@ function readBody(req, limit = 1024 * 1024) {
   });
 }
 
-// 任务键 "sync:0"/"alist:0" 或手动键 "sync"/"alist" 都归一到同一实现
+// 任务键 "sync:0"/"alist:0" 或手动键 "sync"/"alist"/"dedupe" 都归一到同一实现
 function isRunnableKey(key) {
   const k = String(key);
-  if (k === 'sync' || k === 'alist' || k === 'sync-dry') return true;
+  if (k === 'sync' || k === 'alist' || k === 'sync-dry' || k === 'dedupe' || k === 'dedupe-apply') return true;
   return listScheduledTasks().some(t => t.key === k);
 }
 
@@ -261,6 +263,9 @@ async function triggerTask(key) {
   if (k === 'sync-dry') return runSync(undefined, { dryRun: true });
   if (k === 'sync' || k.startsWith('sync:')) return runSync();
   if (k === 'alist' || k.startsWith('alist:')) return runAlist();
+  // 清理重复副本：预览安全，apply 会真的删除云端与本地文件
+  if (k === 'dedupe') return runDedupe(undefined, { apply: false });
+  if (k === 'dedupe-apply') return runDedupe(undefined, { apply: true });
   throw new Error(`未知任务: ${key}`);
 }
 
@@ -437,7 +442,7 @@ function createServer() {
           maxLines: url.searchParams.get('lines') || 500,
           level: url.searchParams.get('level') || '',
           keyword: url.searchParams.get('keyword') || '',
-          // 不传或传了无法识别的值都按「汇总」处理：默认只给关键记录
+          // 不传或传了无法识别的值都按「下载清单」处理：默认只给下载记录
           view: url.searchParams.get('view') || '',
         });
         sendJson(res, 200, result);
@@ -452,6 +457,15 @@ function createServer() {
             { key: 'sync', name: '同步模式', running: isTaskRunning('sync') },
             { key: 'sync-dry', name: '试运行同步（只列出会转存什么）', running: isTaskRunning('sync') },
             { key: 'alist', name: 'AList下载', running: isTaskRunning('alist') },
+            // 清理重复副本：先预览、确认清单后再执行；执行会真的删除云端与本地文件
+            { key: 'dedupe', name: '清理重复副本（预览，只列出）', running: isTaskRunning('sync') },
+            {
+              key: 'dedupe-apply',
+              name: '清理重复副本（执行删除）',
+              running: isTaskRunning('sync'),
+              confirm: '将删除网盘目标文件夹与本地下载目录里多余的重复副本（同一集只保留画质最好的那份）。\n'
+                + '此操作不可撤销，建议先用上面的「预览」。确定继续吗？',
+            },
           ],
         });
         return;
