@@ -85,8 +85,6 @@ test('分享明细视图：步骤进度、逐项明细与去重提示都被折�
     '   ✓ 备用链接 abc 可用',
     '   列出目标文件夹中的文件...',
     '   检查目标文件夹中已存在的文件...',
-    '   ⏭ 同名集去重: ep_Show._S1_E1 (2个版本, 保留 Show.S01E01.4K.mkv)',
-    '   → 去重移除 1 个较低画质版本',
     '   🗑 清理旧文件: old.mkv',
     '   ⏭ 遮天-182 4K.mp4（已带前缀，跳过）',
     '   等待文件处理完成...',
@@ -96,6 +94,16 @@ test('分享明细视图：步骤进度、逐项明细与去重提示都被折�
   ];
   for (const msg of drop) {
     assert.equal(logRecordKeeps(rec('INFO', msg), 'summary'), false, msg);
+  }
+});
+
+test('分享明细视图：同集去重的结论要保留（回答「为什么这份没转存」）', () => {
+  const keep = [
+    '   ⏭ 同名集去重: ep_Show_S1_E1 (2个版本, 保留 Show.S01E01.4K.mkv，丢弃 Show.S01E01.1080p.mkv)',
+    '   → 去重移除 1 个较低画质版本',
+  ];
+  for (const msg of keep) {
+    assert.equal(logRecordKeeps(rec('INFO', msg), 'summary'), true, msg);
   }
 });
 
@@ -111,8 +119,8 @@ test('分享明细视图：多行记录的续行跟着整条记录一起判定',
   const err = `${TS} [ERROR] \n程序异常: 请在 config.json 中填写有效的 Cookie`;
   assert.equal(logRecordKeeps(err, 'summary'), true);
 
-  const detail = rec('INFO', '   ⏭ 同名集去重: ep_Show._S1_E1 (2个版本)')
-    + `\n${TS} [INFO]    → 去重移除 1 个较低画质版本`;
+  const detail = rec('INFO', '   列出目标文件夹中的文件...')
+    + `\n${TS} [INFO]   等待文件处理完成...`;
   assert.equal(logRecordKeeps(detail, 'summary'), false);
 });
 
@@ -201,6 +209,26 @@ test('下载清单视图：清理重复副本的结果也保留（含要删的�
   assert.equal(logRecordKeeps(rec('INFO', '   列出目标文件夹中的文件...'), 'result'), false);
   assert.equal(logRecordKeeps(rec('INFO', '   ✓ 共 4 个文件 (去重后 3 个)'), 'result'), false);
 });
+
+test('下载清单视图：转存成功但改名失败也要看得见（文件没加上前缀）', () => {
+  const err = rec('ERROR', '   ✗ 10 4K.mp4 重命名失败（目标名: 诛仙-10 4K.mp4，fid: f9）: '
+    + 'API 返回错误 [404]: {"status":404,"code":14014,"message":"illegal text"}');
+  assert.equal(logRecordKeeps(err, 'result'), true);
+  // 重试过程中的临时告警不算结论，留到「全部日志」里看
+  assert.equal(logRecordKeeps(rec('INFO', '   ⚠ 改名失败（第 1/3 次），1 秒后重试: API 返回错误 [404]'), 'result'), false);
+});
+
+test('下载清单视图：保留下载任务的标题行，用来分隔几次下载', () => {
+  assert.equal(logRecordKeeps(rec('INFO', '=== AList 下载到本地 ==='), 'result'), true);
+  assert.equal(logRecordKeeps(rec('INFO', '=== 夸克网盘下载到本地 ==='), 'result'), true);
+
+  // 转存侧的标题与分隔线在这个视图里正文会被折叠，留下空标题/孤立横线只会误导，所以不要
+  assert.equal(logRecordKeeps(rec('INFO', '=== 全部转存结果汇总 ==='), 'result'), false);
+  assert.equal(logRecordKeeps(rec('INFO', '=== 本分享转存结果 ==='), 'result'), false);
+  assert.equal(logRecordKeeps(rec('INFO', '=== 夸克网盘自动同步工具 ==='), 'result'), false);
+  assert.equal(logRecordKeeps(rec('INFO', RULE), 'result'), false);
+});
+
 test('下载清单视图：多行记录只在整条命中时才留下', () => {
   const ok = `${TS} [INFO] 下载完成: 1/2 个\n续行不该单独决定去留`;
   assert.equal(logRecordKeeps(ok, 'result'), true);
@@ -421,12 +449,13 @@ test('readLogs：关键字命中续行时整条记录都返回', () => {
   });
 });
 
-test('readLogs：下载清单视图下按级别过滤，ERROR 什么都得不到', () => {
+test('readLogs：下载清单视图下按级别过滤（这份 fixture 没有 ERROR 记录）', () => {
   withFixtureLog(file => {
     const info = readLogs({ file, level: 'INFO' });
     assert.deepEqual(info.lines, FIXTURE_DOWNLOADS);
 
-    // 下载清单里本来就没有报错，按 ERROR 过滤自然是空的（要看报错切「分享明细」）
+    // 这份 fixture 里没有 ERROR 记录，所以按 ERROR 过滤为空。
+    // 注意下载清单现在**会**保留少数 ERROR（改名失败、清理失败），别把这条当成「下载清单里没有 ERROR」
     const err = readLogs({ file, level: 'ERROR' });
     assert.deepEqual(err.lines, []);
     assert.ok(err.folded > 0);

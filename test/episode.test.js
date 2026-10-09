@@ -19,9 +19,16 @@ test('parseEpisode：识别 S01E02 / 第N季第M集 / 第N集', () => {
 });
 
 test('parseEpisode：无季集标记时取最长的数字，并排除年份', () => {
-  // 2019 被当作年份排除，剩下 1080 作为集数（启发式，与实现一致）
-  assert.deepEqual(parseEpisode('movie.2019.1080p.mkv'), { season: 0, episode: 1080 });
+  // 2019 被当作年份排除、1080p 是画质标记也被排除，于是没有可当集数的数字
+  assert.equal(parseEpisode('movie.2019.1080p.mkv'), null);
   assert.deepEqual(parseEpisode('ep12.mkv'), { season: 0, episode: 12 });
+});
+
+test('parseEpisode：画质标记不会被当成集数（4K 与 1080p 是同一集的不同版本）', () => {
+  // 以前 1080 会被当成「第 1080 集」，于是同一集的 4K 与 1080p 判成两集：既不去重、也判不出「已存在」
+  assert.deepEqual(parseEpisode('凡人修仙传-194 1080p.mkv'), { season: 0, episode: 194 });
+  assert.deepEqual(parseEpisode('凡人修仙传-194 4K.mkv'), { season: 0, episode: 194 });
+  assert.deepEqual(parseEpisode('斗罗大陆2绝世唐门-171 2160p.mp4'), { season: 0, episode: 171 });
 });
 
 test('parseEpisode：完全没有数字时返回 null', () => {
@@ -66,6 +73,14 @@ test('deduplicateByEpisode：同集保留最高画质，即便体积更小', () 
   const out = deduplicateByEpisode(files);
   assert.equal(out.length, 1);
   assert.equal(out[0].file_name, 'Show.S01E01.4K.mkv');
+});
+
+test('deduplicateByEpisode：1080p 不会被当成第 1080 集，同集的 4K 与 1080p 只留 4K', () => {
+  const out = deduplicateByEpisode([
+    { file_name: '凡人修仙传-194 1080p.mkv', size: 1500 },
+    { file_name: '凡人修仙传-194 4K.mkv', size: 3300 },
+  ]);
+  assert.deepEqual(out.map(f => f.file_name), ['凡人修仙传-194 4K.mkv']);
 });
 
 test('deduplicateByEpisode：画质相同时保留体积更大的', () => {

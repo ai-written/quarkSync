@@ -212,6 +212,10 @@ export function normalizeLogView(view) {
 // 清单里的文件名不是靠这张表认出来的 —— 转存结果清单的文件行长得一模一样、缩进也一样，
 // 只能靠「是否紧跟在本清单标题之后」判断，见下面的 downloadListFlags。
 const DOWNLOAD_KEEP = [
+  // 下载任务的标题：一次同步里下载跑两趟、或隔几次任务各下载一次时，
+  // 只有它能让人看出「这段清单属于哪一次下载」（═ 分隔线只在转存侧，这里会出现孤立横线）
+  /^=+ AList 下载到本地 =+ *$/m,
+  /^=+ 夸克网盘下载到本地 =+ *$/m,
   /^\s*待下载: \d+/m,                  // 待下载: 5 个 (跳过 1 个已下载记录)
   /^\s*下载完成: \d+/m,                // 下载完成: 3/5 个
   /^\s*所有文件已下载过，无需下载/m,
@@ -223,6 +227,7 @@ const DOWNLOAD_KEEP = [
   /^\s*(将删除|🗑 删除) \d+ 个，保留 /m,   // 整组是一条多行记录，清单里的文件名跟着一起留
   /^\s*(已删除|待删除) \d+ 个重复副本/m,
   /^\s*✗ (云端|本地)(清理|删除|重命名)失败/m,   // 删除失败必须让人看到，不能悄悄消失
+  /^\s*✗ .*重命名失败/m,                // 加前缀失败（含清理侧的云端重命名失败）：文件还在，名字不对
 ];
 
 // 「分享明细」（summary）的保留清单：任务边界、结果统计、状态变更、文件清单与筛选漏斗。
@@ -249,6 +254,8 @@ const SUMMARY_KEEP = [
   /其中文件: \d+ 个/m,
   /时间窗口内 .*: \d+ 个/m,
   /过滤 <.*后剩余: \d+ 个/m,
+  /⏭ 同名集去重: /m,                   // 同集多版本：留下哪份、丢了哪份（转存与下载都走这里）
+  /→ 去重移除 \d+ 个较低画质版本/m,
   /限制每分享最多 \d+ 个/m,
   /→ 候选文件: \d+ 个/m,
   /跳过 \d+ 个已存在的文件/m,
@@ -729,6 +736,10 @@ async function tryShareUrls(client, pwdIds, passcode, tip, deadSet) {
 // 去掉「 (2)」「（3）」这类为避免重名自动加的序号后缀（只认扩展名前的 2..999）。
 // 序号副本与原始文件是同一份内容，比对集数前必须先归一化，否则会被当成两集，
 // 于是「同名集去重」永远合并不掉，下载与清理都看不出它们是重复的。
+// 480/576/720/1080/2160 这几个数字排除掉：`剧名 (720).mkv` 里的 720 是分辨率写法，
+// 不是自动序号，剥掉会让它连集数都解析不出来。
+const RESOLUTION_NUMBERS = new Set([480, 576, 720, 1080, 2160]);
+
 export function stripNumericSuffix(fileName) {
   const s = String(fileName ?? '');
   const dot = s.lastIndexOf('.');
@@ -737,31 +748,52 @@ export function stripNumericSuffix(fileName) {
   const m = base.match(/^(.*?)[\s]*[（(](\d{1,3})[)）]$/);
   if (!m) return s;
   const n = Number(m[2]);
-  if (n < 2) return s;   // (0)/(1) 不当作自动序号，避免误改正常名字
+  if (n < 2 || RESOLUTION_NUMBERS.has(n)) return s;   // (0)/(1) 与分辨率写法都不当作自动序号
   return `${m[1].replace(/\s+$/, '')}${ext}`;
 }
+
+// 画质/编码标记不是集数：`凡人修仙传-194 1080p.mkv` 里的 1080 是画质，不是第 1080 集。
+// 不先去掉它们，「取最长数字当集数」的启发式就会挑中 1080/2160/720，
+// 于是同一集的 4K 与 1080p 被判成两集 —— 既不去重、也判不出「已存在」，重复就是这么来的。
+const EPISODE_NOISE = /(\d{3,4}\s*[xX]\s*\d{3,4}|1080p|720p|2160p|480p|4k|8k|uhd|fhd|hdr10\+?|hdr|hevc|x265|x264|h264|avc|10bit|8bit|web-?dl|bluray|remux|aac|dts|60fps)/gi;
 
 // parseEpisode 的内部版本：额外给出「季号是不是明确写出来的」。
 // 灵境行者-S01E07.mkv（季 1）与 灵境行者-07.mkv（没写季）是同一集，可以合并；
 // 但 第1季第7集 与 第2季第7集 不是同一集 —— 只有知道季号是否明确，才能安全地合并。
-function parseEpisodeInfo(fileName) {
-  const name = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
+// keepNoise 只给 getEpisodeKey 用：那边的输出是 .downloaded.json 的记录键，
+// 必须沿用历史算法，改了会让升级前的记录全部失配、触发全量重下（见 getEpisodeKey 的注释）。
+function parseEpisodeInfo(fileName, { keepNoise = false } = {}) {
+  const base = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
+  const name = keepNoise ? base : base.replace(EPISODE_NOISE, ' ');
   let m;
 
   m = name.match(/[Ss](\d+)\s*[Ee](?:\s*P\s*)?(\d+)/);
-  if (m) return { season: +m[1], episode: +m[2], seasonKnown: true };
+  if (m) return { season: +m[1], episode: +m[2], seasonKnown: true, notation: 'se' };
 
   m = name.match(/第?\s*(\d+)\s*季.*?第?\s*(\d+)\s*集/);
-  if (m) return { season: +m[1], episode: +m[2], seasonKnown: true };
+  if (m) return { season: +m[1], episode: +m[2], seasonKnown: true, notation: 'seasonCn' };
+
+  // 「第1季-02」「第1季 02」「.第1季.E02」：季与集之间只有分隔符（没写「集」字）。
+  // 不认这几种写法，它们就会掉进下面「取最长数字」的启发式 —— `第1季-02` 会算成第 1 集，
+  // 于是同一季的 01/02/03 全被当成同一集（实测复现过：转存漏转、清理会误删）。
+  m = name.match(/第?\s*(\d+)\s*季\s*[-_. ]\s*[Ee]?\s*(\d+)/);
+  if (m) return { season: +m[1], episode: +m[2], seasonKnown: true, notation: 'seasonSep' };
+
+  // 「1x02」：两侧都是 1~2 位数字，且不能是 `1920x1080` 这类分辨率
+  m = name.match(/(?:^|[^\d])(\d{1,2})\s*[xX]\s*(\d{1,3})(?![\d])/);
+  if (m) return { season: +m[1], episode: +m[2], seasonKnown: true, notation: 'x' };
 
   m = name.match(/第?\s*(\d+)\s*集/);
-  if (m) return { season: 0, episode: +m[1], seasonKnown: false };
+  if (m) return { season: 0, episode: +m[1], seasonKnown: false, notation: 'epCn' };
+
+  // 只写了季、没写集（整季包）：宁可当作不认识，也不能让整季落进「取最长数字」而互相合并
+  if (/[Ss]\d{1,2}(?![\d])|第\s*\d+\s*季/.test(name)) return null;
 
   const nums = [...name.matchAll(/(\d+)/g)].map(n => +n[1]);
   const nonYear = nums.filter(n => n < 1900 || n > 2099);
   if (nonYear.length > 0) {
     const best = nonYear.reduce((a, b) => String(a).length >= String(b).length ? a : b);
-    return { season: 0, episode: best, seasonKnown: false };
+    return { season: 0, episode: best, seasonKnown: false, notation: 'bare' };
   }
 
   return null;
@@ -801,19 +833,35 @@ function episodeShow(fileName) {
 
 // 严格键：季号参与区分（S01E07 与 S02E07 是两个键）。.downloaded.json 用它，
 // 所以不能把季号抹掉，否则升级后旧记录全部失配、触发全量重下。
+// 集数同样按**历史算法**解析（keepNoise）：这条键的唯一职责是「和已有记录对得上」，
+// 不是「算得对」。需要正确集数的地方（分组、去重、清理）走 getEpisodeGroup。
 export function getEpisodeKey(fileName) {
-  const info = parseEpisodeInfo(fileName);
+  const info = parseEpisodeInfo(fileName, { keepNoise: true });
   if (!info) return null;
   return `ep_${episodeShow(fileName)}_S${info.season}_E${info.episode}`;
 }
 
-// 仅用于「同一集」分组的剧名：把分隔符与大小写归一化。
-// 场景命名混用时（Show.S01E07.mkv / Show-07.mkv）剧名会差一个分隔符，
-// 归一化后才能认出它们同属一部剧。
-// 注意只有分组用它；getEpisodeKey 的剧名保持原样 —— 那是 .downloaded.json 的记录键，
-// 改动会让升级前的记录全部失配、触发全量重下。
+// 分组用的剧名：剥掉画质/编码词与季集标记、分隔符归一成单个空格、小写。
+// 为什么不复用 episodeShow：那个函数的输出是 .downloaded.json 的记录键，只能保持历史行为；
+// 分组要的是「算得对」，可以独立改进（改它不会动任何旧记录）。
+//
+// 几个刻意的取舍：
+// - 只剥**被分隔符/边界包住**的画质与编码词：`SD高达`、`4K纪录片` 里的 SD/4K 是剧名的一部分，
+//   剥掉会把两部不同的剧并成同一集 —— 清理重复副本就会误删其中一份（真实文件名验证过）
+// - 结尾集数必须**带分隔符**才剥：`斗罗大陆2` 与 `斗罗大陆-02` 是两部剧，不能都归成「斗罗大陆」
+// - 分隔符归一成空格而不是删掉：`Show-A` 与 `Showa` 要保持不同
 function episodeShowLoose(fileName) {
-  return episodeShow(fileName).replace(/[.\-_\s]+/g, '').toLowerCase();
+  let s = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
+  s = s.replace(
+    /(^|[-_.\s[\]()（）])(hdr10\+?|hdr|dolby\s*vision|dolbyvision|8k|4k|2160p|1080p|720p|480p|uhd|fhd|hd|sd|hevc|x265|x264|h264|avc|10bit|8bit|web-?dl|bluray|remux|aac|dts|60fps)(?=$|[-_.\s[\]()（）])/gi,
+    '$1',
+  );
+  s = s.replace(/[-_.\s]*[Ss]\d{1,2}(?:[-_.\s]*[Ee]\d{1,3})?.*$/, '');   // S01E07 / S01
+  s = s.replace(/[-_.\s]*第?\s*\d+\s*季.*$/, '');
+  s = s.replace(/[-_.\s]*第?\s*\d+\s*集.*$/, '');
+  s = s.replace(/[-_.\s]*\d{1,2}\s*[xX]\s*\d{1,3}.*$/, '');              // 1x07
+  s = s.replace(/[-_.\s]+\d+\s*$/, '');                                  // 结尾集数（必须带分隔符）
+  return s.replace(/[.\-_\s]+/g, ' ').trim().toLowerCase();
 }
 
 // 宽松分组信息：loose 忽略季号，season 是明确季号（没写季号时为 null）。
@@ -825,6 +873,8 @@ export function getEpisodeGroup(fileName) {
   return {
     loose: `ep_${episodeShowLoose(fileName)}_E${info.episode}`,
     season: info.seasonKnown ? info.season : null,
+    // 季集写法（se / seasonCn / seasonSep / x / epCn / bare）：清理时的「为什么算重复」要用它
+    notation: info.notation,
   };
 }
 
@@ -859,7 +909,11 @@ export function compareForKeep(a, b) {
   const na = stripNumericSuffix(aName) === aName ? 0 : 1;
   const nb = stripNumericSuffix(bName) === bName ? 0 : 1;
   if (na !== nb) return na - nb;
-  return (a.updated_at || 0) - (b.updated_at || 0);
+  const ta = a.updated_at || 0;
+  const tb = b.updated_at || 0;
+  if (ta !== tb) return ta - tb;
+  // 并列时按名字定序：否则「留哪一份」取决于 readdir / 接口返回顺序，同样的目录两次跑可能给出不同结果
+  return String(aName).localeCompare(String(bName));
 }
 
 // 按「同一集」把文件分桶：loose 相同的先放一起，桶内再按明确季号区分。
@@ -924,21 +978,51 @@ export function indexHasSameEpisode(index, fileName) {
   return hit.seasons.has(info.season);
 }
 
-// 找出「同一集留了多份」的组合，每组按保留优先级排好序（keep 是最该留的那份）。
-// 云端清理与本地清理都用它；导出仅为测试用，可直接验证挑选结果。
-export function findDuplicateSets(files) {
-  const sets = [];
+// 「凭什么说这几份是同一集的重复」—— 必须有可解释的证据才动手：
+// - 有序号副本：名字里带自动加的 `(2)(3)`（`stripNumericSuffix` 能剥掉）
+// - 画质不同：4K / 1080p 这类（保留画质高的那份）
+// - 季集写法不同：`S01E07` 与 `07`、`第1季-07` 与 `第07集` 这类
+// 三条都对不上时（只是名字凑巧被归一化成同一个键），一律**不动** ——
+// 删除不可逆，而分组靠的是文件名启发式，两部剧名相近时完全可能撞到一起。
+function duplicateEvidence(group, nameOf) {
+  const names = group.map(nameOf);
+  if (names.some(n => stripNumericSuffix(n) !== n)) return '有序号副本';
+  if (new Set(names.map(getQualityScore)).size > 1) return '画质不同';
+  const notations = new Set(group.map(f => getEpisodeGroup(nameOf(f))?.notation));
+  if (notations.size > 1) return '季集写法不同';
+  return null;
+}
+
+// 按「同一集」分组，并标出证据。返回 { groups, unexplained }：
+// groups = [{ key, group, evidence }] 可以放心去重/删除；unexplained 只报告不处理。
+function explainedGroups(files) {
+  const nameOf = f => f.file_name || f.name;
+  const groups = [];
+  const unexplained = [];
   for (const [key, group] of groupByEpisode(files)) {
     if (group.length < 2) continue;
-    const sorted = [...group].sort(compareForKeep);
-    sets.push({ key, keep: sorted[0], drop: sorted.slice(1) });
+    const evidence = duplicateEvidence(group, nameOf);
+    if (evidence) groups.push({ key, group, evidence });
+    else unexplained.push({ key, group });
   }
-  return sets;
+  return { groups, unexplained };
+}
+
+// 找出「同一集留了多份」的组合，每组按保留优先级排好序（keep 是最该留的那份）。
+// 解释不了为什么算重复的组放进 skipped，由调用方报告、不删。
+// 云端清理与本地清理都用它；导出仅为测试用。
+export function findDuplicateSets(files) {
+  const { groups, unexplained } = explainedGroups(files);
+  const sets = groups.map(({ key, group, evidence }) => {
+    const sorted = [...group].sort(compareForKeep);
+    return { key, keep: sorted[0], drop: sorted.slice(1), evidence };
+  });
+  return { sets, skipped: unexplained };
 }
 
 // 同名集去重：同集保留画质最高的那份（画质相同则取体积更大的）。
-// 与旧版相比，这里能认出「加过序号的副本」（... (2).mkv）与「写/不写季号」的同一集，
-// 因此不会再放着一堆重复文件不管。
+// 只处理能解释清楚为什么算重复的组（见 duplicateEvidence）：解释不了的整组保留 ——
+// 漏下一份可以补，删错/漏掉一集就麻烦得多。
 //
 // 这里不直接写日志，而是通过 onSkip 回调交给调用方 —— 保持本函数是纯函数：
 // 单测可以直接调用它，不会把测试输出写进真实的 sync.log。
@@ -946,7 +1030,8 @@ export function deduplicateByEpisode(files, { onSkip } = {}) {
   const kept = new Set();
   const grouped = new Set();
   let removed = 0;
-  for (const [key, group] of groupByEpisode(files)) {
+  const { groups, unexplained } = explainedGroups(files);
+  for (const { key, group } of groups) {
     const sorted = [...group].sort(compareForKeep);
     for (const f of group) grouped.add(f);
     kept.add(sorted[0]);
@@ -957,6 +1042,10 @@ export function deduplicateByEpisode(files, { onSkip } = {}) {
     }
   }
   if (removed > 0 && onSkip) onSkip(`   → 去重移除 ${removed} 个较低画质版本\n`);
+  for (const { key, group } of unexplained) {
+    const names = group.map(f => f.file_name || f.name).join(' / ');
+    if (onSkip) onSkip(`   ⚠ 名字相近但无法确认是同一集的重复，都保留: ${names} (${key})\n`);
+  }
   // 输出保持输入顺序：调用方拿到的顺序与接口返回一致。
   // 识别不出集数的文件（电影、特别篇）不属于任何分组，原样保留。
   return files.filter(f => !grouped.has(f) || kept.has(f));
@@ -1062,21 +1151,68 @@ async function downloadToFile({ url, headers = {}, savePath, expectedSize = 0, l
   return received;
 }
 
-// 判断本地是否已有一份完整的副本（用于决定能否跳过下载）。
+// 本地已有文件的「同一集 + 季号 + 体积」索引，键形如 `ep_凡人修仙传_E194|S0|3328599654`。
+// 为什么需要它：清理重复副本会把云端留下的那份**改回不带序号的名字**，本地那份有意不改名，
+// 于是云端的 `X.mkv` 对应本地的 `X (2).mkv` —— 按同名找不到，会被误判成「本地没有」而重下一遍。
+// 同一集、同季号、体积完全一致就是同一份内容。
 //
+// 键用分组键 + **季号**（这是内存索引，不涉及 .downloaded.json 的兼容）：
+// - 不带季号会让本地的 S02E07 证明云端的 S01E07 已下载 —— 那是静默漏下，谁也不会发现
+// - 用分组键而不是记录键，还能兼容「同一集的不同季集写法」：`第1季-01`、`1x01`、`.第1季.E01`
+//   归一后是同一个键，不必因为写法不同就重下一遍
+// 点文件与 `.part` 半成品一律跳过：半成品体积可能正好等于声明大小，会把残缺文件判成完整。
+// 导出仅为测试用。
+export function buildLocalEpisodeIndex(saveDir) {
+  const index = new Set();
+  let entries;
+  try {
+    entries = fs.readdirSync(saveDir);
+  } catch {
+    return index;
+  }
+  for (const name of entries) {
+    if (name.startsWith('.') || name.endsWith('.part')) continue;
+    const info = getEpisodeGroup(name);
+    if (!info) continue;
+    let size = -1;
+    try {
+      const st = fs.statSync(path.join(saveDir, name));
+      if (st.isFile()) size = st.size;
+    } catch {}
+    if (size >= 0) index.add(`${info.loose}|S${info.season ?? '?'}|${size}`);
+  }
+  return index;
+}
+
 // 仅凭 .downloaded.json 里的记录判断是不够的：记录只说明"曾经下过"，
 // 无法证明磁盘上那份是完整的。此前下载被截断却误报成功时，记录已经写下，
 // 于是半成品会被永久跳过、永不自愈。这里按列表声明的大小再核对一次，
 // 缺失或大小不符都视为需要重新下载。
-function localCopyIsComplete(saveDir, name, expectedSize) {
-  try {
-    const st = fs.statSync(path.join(saveDir, name));
-    if (!st.isFile()) return false;
-    if (expectedSize > 0 && st.size !== expectedSize) return false;
-    return true;
-  } catch {
-    return false;
-  }
+// localIndex 由 buildLocalEpisodeIndex 预先算好：同名找不到时再按「同一集 + 同体积」找一遍，
+// 兼容清理重复副本改过名的情形（改了名不等于没下过）。
+// 导出仅为测试用。
+export function localCopyIsComplete(saveDir, name, expectedSize, localIndex = null) {
+  const sizeOf = n => {
+    try {
+      const st = fs.statSync(path.join(saveDir, n));
+      return st.isFile() ? st.size : -1;
+    } catch {
+      return -1;
+    }
+  };
+
+  const exact = sizeOf(name);
+  if (exact >= 0 && (!(expectedSize > 0) || exact === expectedSize)) return true;
+
+  // 体积未知（接口没给 size）时不做「同一集」推断：没有体积就没有可核对的凭据
+  if (!(expectedSize > 0)) return false;
+  // 索引键与 buildLocalEpisodeIndex 必须完全一致：分组键 + 季号 + 体积
+  const info = getEpisodeGroup(name);
+  if (!info) return false;
+  const key = `${info.loose}|S${info.season ?? '?'}|${expectedSize}`;
+
+  if (localIndex) return localIndex.has(key);
+  return buildLocalEpisodeIndex(saveDir).has(key);
 }
 
 class QuarkClient {
@@ -1141,8 +1277,12 @@ class QuarkClient {
   async listAllUserFiles(pdirFid = '0') {
     const result = [];
     let page = 1;
+    // 本目录已列出的条目数（含子目录）。不能拿 result.length 去比 total：result 里还含
+    // 递归进来的子目录文件，会比 total 先变大而提前 break，把后面的当层文件整页漏掉。
+    let seen = 0;
     while (true) {
       const { list, total } = await this.listUserFiles(pdirFid, page);
+      seen += list.length;
       for (const f of list) {
         if (!f.dir) result.push(f);
         if (f.dir && f.include_items > 0) {
@@ -1150,7 +1290,7 @@ class QuarkClient {
           result.push(...sub);
         }
       }
-      if (list.length === 0 || result.length >= total) break;
+      if (list.length === 0 || seen >= total) break;
       page++;
     }
     return result;
@@ -1326,12 +1466,14 @@ class QuarkClient {
     }
 
     const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
+    // 预先算一次：清理重复副本改过名时，靠它按「同一集 + 同体积」认出本地那份
+    const localIndex = skipExisting ? buildLocalEpisodeIndex(saveDir) : null;
     let incomplete = 0;
     const toDownload = skipExisting
       ? files.filter(f => {
         if (!downloadedRecord.has(getDedupKey(f))) return true;
         // 有记录也要确认本地那份是完整的，否则重新下载（自愈被截断的半成品）
-        if (localCopyIsComplete(saveDir, f.file_name, f.size)) return false;
+        if (localCopyIsComplete(saveDir, f.file_name, f.size, localIndex)) return false;
         incomplete++;
         return true;
       })
@@ -1645,24 +1787,57 @@ export function normalizePrefix(tip) {
   return tip.endsWith('-') ? tip : `${tip}-`;
 }
 
-// 给刚转存的文件加上文件名前缀，返回实际使用的文件名数组（顺序与 names 一致）。
+// 改名重试：夸克的改名接口偶发 `404 / code 14014 "illegal text"` 这类瞬时错误 ——
+// 转存任务刚报完成时，文件在改名接口那侧可能还没就绪（线上真的遇到过，一次失败就永久没前缀）。
+// 退避重试仍失败，再按 fid 复核一次：那个 fid 的文件名已经变成目标名，说明其实改成功了
+// （接口回了假错误），按成功处理 —— 不能去报一个并不存在的失败。
+// targetDirFid 只用于复核；复核失败（网络抖动）按失败处理，下次同步还能看到未加前缀的文件。
+async function renameFileWithRetry(client, fid, target, { retries, delays, say, targetDirFid }) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      await client.renameFile(fid, target);
+      return { ok: true };
+    } catch (e) {
+      lastError = e;
+      if (attempt < retries) {
+        const wait = delays[attempt] ?? delays[delays.length - 1] ?? 1000;
+        say(`   ⚠ 改名失败（第 ${attempt + 1}/${retries + 1} 次），${Math.round(wait / 1000)} 秒后重试: ${e.message}`);
+        if (wait > 0) await new Promise(r => setTimeout(r, wait));
+      }
+    }
+  }
+  try {
+    const files = await client.listAllUserFiles(targetDirFid);
+    const now = files.find(f => f.fid === fid);
+    if (now && now.file_name === target) return { ok: true, verified: true };
+  } catch {}
+  return { ok: false, error: lastError };
+}
+
+// 给刚转存的文件加上文件名前缀，返回实际使用的文件名数组（顺序与 names 一致）。导出仅为测试用。
 //
 // 关于重名：若「前缀 + 原名」已被占用，不能简单跳过——那会留下一个没有前缀的
 // 文件，既破坏前缀约定，用户也难以分辨哪份是本次转存的。能走到这一步说明转存前
 // 的去重（按「名称|大小」比对）没有命中，即已有的那个是同名但大小不同的另一份
 // 内容，不能丢弃。因此改为换用唯一名称（" (2)"、" (3)" …），既保住前缀又保留两份。
-async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {}) {
+export async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {}) {
   const out = [...names];
   if (!shareTip || names.length === 0) return out;
 
   const settleMs = opts.settleMs ?? 2000;
   const retryMs = opts.retryMs ?? 1000;
   const maxSuffix = opts.maxSuffix ?? 999;
+  const renameRetries = opts.renameRetries ?? 2;
+  const renameRetryDelays = opts.renameRetryDelays ?? [1000, 3000];
+  // 日志可注入：单测传空实现，就不会把测试输出写进真实的 sync.log
+  const say = opts.log ?? log;
+  const sayError = opts.logError ?? logError;
 
-  log('\n   等待文件处理完成...');
+  say('\n   等待文件处理完成...');
   await new Promise(r => setTimeout(r, settleMs));
 
-  log('   添加文件名前缀...');
+  say('   添加文件名前缀...');
   const prefix = normalizePrefix(shareTip);
 
   let existingFiles = await client.listAllUserFiles(targetDirFid);
@@ -1676,7 +1851,7 @@ async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {})
     // 分享里的文件可能本身就带这个前缀（例如 tip 与剧集名相同），
     // 此时不再叠加，否则会得到「遮天-遮天-01.mp4」这种名字
     if (name.startsWith(prefix)) {
-      log(`   ⏭ ${name}（已带前缀，跳过）`);
+      say(`   ⏭ ${name}（已带前缀，跳过）`);
       continue;
     }
 
@@ -1693,41 +1868,46 @@ async function applyNamePrefix(client, targetDirFid, names, shareTip, opts = {})
         if (!taken.has(cand)) { target = cand; break; }
       }
       if (!target) {
-        log(`   ✗ ${wanted} 已被占用，且 2..${maxSuffix} 的序号名也都已被占用，跳过重命名`);
+        say(`   ✗ ${wanted} 已被占用，且 2..${maxSuffix} 的序号名也都已被占用，跳过重命名`);
         continue;
       }
     }
 
     let match = existingFiles.find(f => f.file_name === name);
     if (!match) {
-      log(`   重试查找 ${name}...`);
+      say(`   重试查找 ${name}...`);
       await new Promise(r => setTimeout(r, retryMs));
       existingFiles = await client.listAllUserFiles(targetDirFid);
       for (const f of existingFiles) taken.add(f.file_name);
       match = existingFiles.find(f => f.file_name === name);
     }
     if (!match) {
-      log(`   ✗ ${name} 仍未找到，跳过重命名`);
+      say(`   ✗ ${name} 仍未找到，跳过重命名`);
       continue;
     }
-    try {
-      await client.renameFile(match.fid, target);
-      renamed++;
-      taken.add(target);
-      out[i] = target;
-      if (target === wanted) {
-        log(`   ✓ ${name} → ${target}`);
-      } else {
-        collided++;
-        log(`   ✓ ${name} → ${target}（${wanted} 已存在，加序号避免覆盖）`);
-      }
-    } catch (e) {
-      log(`   ✗ ${name} 重命名失败: ${e.message}`);
+
+    const r = await renameFileWithRetry(client, match.fid, target, {
+      retries: renameRetries, delays: renameRetryDelays, say, targetDirFid,
+    });
+    if (!r.ok) {
+      // 目标名与 fid 都写进日志：否则事后只看到「重命名失败」，无法判断是名字问题还是瞬时问题
+      sayError(`   ✗ ${name} 重命名失败（目标名: ${target}，fid: ${match.fid}）: ${r.error.message}`);
+      continue;
+    }
+    renamed++;
+    taken.add(target);
+    out[i] = target;
+    const suffixNote = target === wanted ? '' : `（${wanted} 已存在，加序号避免覆盖）`;
+    if (target !== wanted) collided++;
+    if (r.verified) {
+      say(`   ✓ ${name} → ${target}（接口报了错，复核后确认已经改好）${suffixNote}`);
+    } else {
+      say(`   ✓ ${name} → ${target}${suffixNote}`);
     }
   }
 
-  if (renamed > 0) log(`   已重命名 ${renamed} 个文件\n`);
-  if (collided > 0) log(`   提示: 其中 ${collided} 个因重名改用带序号的文件名，两份都已保留\n`);
+  if (renamed > 0) say(`   已重命名 ${renamed} 个文件\n`);
+  if (collided > 0) say(`   提示: 其中 ${collided} 个因重名改用带序号的文件名，两份都已保留\n`);
   return out;
 }
 
@@ -1865,6 +2045,11 @@ async function syncInternal(config, opts = {}) {
         log(`   过滤 <${minSizeMB}MB 后剩余: ${largeFiles.length} 个`
           + (unknownSize > 0 ? `（其中 ${unknownSize} 个大小未知，已按 0 排除）` : ''));
       }
+
+      // 分享里同一集有多个版本时只留画质最好的那份（4K 优先；同画质取体积大的）。
+      // 下载侧一直这么做（README 也是这么写的），但转存侧此前漏了 —— 一次同步就会把
+      // 同一集的 4K 与 1080p 双双转进网盘，先造成重复，之后每轮还要靠去重兜着。
+      largeFiles = deduplicateByEpisode(largeFiles, { onSkip: log });
 
       const maxPerShare = itemMaxFiles ?? config.maxFilesPerShare ?? 0;
       if (maxPerShare > 0 && largeFiles.length > maxPerShare) {
@@ -2220,12 +2405,14 @@ class AlistClient {
     }
 
     const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
+    // 预先算一次：清理重复副本改过名时，靠它按「同一集 + 同体积」认出本地那份
+    const localIndex = skipExisting ? buildLocalEpisodeIndex(saveDir) : null;
     let incomplete = 0;
     const toDownload = skipExisting
       ? files.filter(f => {
         if (!downloadedRecord.has(getDedupKey(f))) return true;
         // 有记录也要确认本地那份是完整的，否则重新下载（自愈被截断的半成品）
-        if (localCopyIsComplete(saveDir, f.name, f.size)) return false;
+        if (localCopyIsComplete(saveDir, f.name, f.size, localIndex)) return false;
         incomplete++;
         return true;
       })
@@ -2290,31 +2477,18 @@ class AlistClient {
 
 async function alistMode(forceDownload = false) {
   const config = loadConfig();
-  const alistUrl = config.alistUrl;
-  if (!alistUrl) {
+  if (!config.alistUrl) {
     logError('错误: 请在 config.json 中填写 alistUrl');
     process.exit(1);
   }
 
-  const alistPath = config.alistPath || '/kuake/来自：分享';
+  // CLI 走自己的文件锁；下载与清理逻辑复用 alistInternal，避免两处漂移
+  // （标题、来源回显、清理日志都只写一份）
   const saveDir = path.resolve(config.downloadDir || '.');
   if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
   acquireLock('.alist.lock', saveDir);
 
-  log('=== AList 下载到本地 ===\n');
-  log(`AList: ${alistUrl}`);
-  log(`路径: ${alistPath}`);
-  log(`保存到: ${saveDir}\n`);
-
-  const skipExisting = !forceDownload;
-  const client = new AlistClient(alistUrl, config.alistToken, config.alistRefresh);
-  await client.downloadDir(alistPath, saveDir, skipExisting, config.deleteAfterDownload);
-
-  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
-    log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
-    const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays);
-    log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
-  }
+  await alistInternal(config, { skipExisting: !forceDownload });
 }
 
 export function normalizeShareUrls(config) {
@@ -2434,7 +2608,7 @@ export async function runAlist(config) {
   return withTaskLock('alist', () => alistInternal(config ?? loadConfig()));
 }
 
-async function alistInternal(config) {
+async function alistInternal(config, { skipExisting = true } = {}) {
   const alistUrl = config.alistUrl;
   // alistMode(CLI) 自带校验，这里补上是为了让 cron、网页手动触发、启动补跑
   // 也都拿到可读提示，而不是 AlistClient 里 undefined.replace 的报错
@@ -2444,8 +2618,14 @@ async function alistInternal(config) {
   const alistPath = config.alistPath || '/kuake/来自：分享';
   const saveDir = path.resolve(config.downloadDir || '.');
   if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+  // 任务标题与来源回显放在这里，而不是只放在 CLI 的 alistMode 里：
+  // cron / 网页手动触发 / 启动补跑走的都是这个函数，没有标题就没法把几次下载分清楚
+  log('=== AList 下载到本地 ===\n');
+  log(`AList: ${alistUrl}`);
+  log(`路径: ${alistPath}`);
+  log(`保存到: ${saveDir}\n`);
   const client = new AlistClient(alistUrl, config.alistToken, config.alistRefresh);
-  await client.downloadDir(alistPath, saveDir, true, config.deleteAfterDownload);
+  await client.downloadDir(alistPath, saveDir, skipExisting, config.deleteAfterDownload);
   log(`   AList下载完成`);
 
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
@@ -2482,7 +2662,7 @@ export function cleanupLocalDuplicates(saveDir, { apply = false } = {}) {
     files.push({ name: e.name, size: stat.size, updated_at: stat.mtimeMs, full });
   }
 
-  const sets = findDuplicateSets(files);
+  const { sets, skipped } = findDuplicateSets(files);
   const deleted = [];
   const failed = [];
   for (const s of sets) {
@@ -2496,13 +2676,13 @@ export function cleanupLocalDuplicates(saveDir, { apply = false } = {}) {
       }
     }
   }
-  return { sets, kept: sets.map(s => s.keep), deleted, failed, scanned: files.length };
+  return { sets, skipped, kept: sets.map(s => s.keep), deleted, failed, scanned: files.length };
 }
 
 // 云端（转存目标文件夹当层）里的重复：同一集留一份。
 async function cleanupCloudDuplicates(client, targetDirFid, { apply = false } = {}) {
   const files = await client.listTopLevelFiles(targetDirFid);
-  const sets = findDuplicateSets(files);
+  const { sets, skipped } = findDuplicateSets(files);
   const deleted = [];
   const renamed = [];
 
@@ -2540,7 +2720,15 @@ async function cleanupCloudDuplicates(client, targetDirFid, { apply = false } = 
     for (const s of sets) deleted.push(...s.drop);
   }
 
-  return { sets, kept: sets.map(s => s.keep), deleted, renamed, scanned: files.length };
+  return { sets, skipped, kept: sets.map(s => s.keep), deleted, renamed, scanned: files.length };
+}
+
+// 报告「名字相近但无法确认是同一集」的组：列表本身不动，只提示，避免静默地留着或删错
+function logUnexplainedGroups(skipped, nameOf) {
+  for (const { group } of skipped) {
+    const names = group.map(nameOf).join(' / ');
+    logError(`   ⚠ 名字相近但无法确认是同一集的重复，都保留: ${names}`);
+  }
 }
 
 // 一组重复的清单做成**一条多行记录**：日志视图是按「记录」过滤的，
@@ -2568,6 +2756,11 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
         const targetDirFid = await client.resolveTargetDir(config, { dryRun: true });
         if (targetDirFid === null) {
           log('   ✓ 目标文件夹不存在，无需清理');
+        } else if (targetDirFid === '0' && apply) {
+          // 没配目标文件夹时它是网盘根目录：那里什么都有，真删起来是灾难。
+          // 预览仍然允许（只列清单），但执行删除直接拒绝。
+          logError('   ✗ 未配置目标文件夹（targetDirName / targetDirFid），本功能只清目标文件夹，'
+            + '拒绝在网盘根目录执行删除。请先在配置页填好目标文件夹。');
         } else {
           if (targetDirFid === '0') {
             logError('   ⚠ 未配置目标文件夹，将扫描网盘根目录（建议先在配置页填好目标文件夹）');
@@ -2577,6 +2770,7 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
           for (const s of r.sets) {
             log(dedupeGroupLine(apply, s.drop, s.keep.file_name, f => f.file_name));
           }
+          logUnexplainedGroups(r.skipped, f => f.file_name);
           for (const line of r.renamed) log(`   ✓ 已改回不带序号的名字: ${line}`);
           totalDrop += r.deleted.length;
         }
@@ -2591,6 +2785,9 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
     const dir = String(config.downloadDir || '').trim();
     if (!dir) {
       logError('\n   ⚠ 未配置 downloadDir，跳过本地清理');
+    } else if (!fs.existsSync(path.resolve(dir))) {
+      // 目录还没建起来（从没下载过）：不是错误，别报成「本地清理失败」
+      log(`\n2. 本地目录还不存在（${path.resolve(dir)}），无需清理`);
     } else {
       const saveDir = path.resolve(dir);
       log(`\n2. 检查本地目录 ${saveDir}...`);
@@ -2600,6 +2797,7 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
         for (const s of r.sets) {
           log(dedupeGroupLine(apply, s.drop, s.keep.name, f => f.name));
         }
+        logUnexplainedGroups(r.skipped, f => f.name);
         for (const msg of r.failed) logError(`   ✗ 本地删除失败 ${msg}`);
         totalDrop += r.deleted.length;
       } catch (e) {
@@ -2613,15 +2811,33 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
   return { apply, total: totalDrop };
 }
 
-// 云端清理动的是同步的目标文件夹，所以外层共用同步任务锁：跨进程也有效（cron 用的是同一把锁），
-// 不会出现一边在删、一边在转存。内层再加一把 dedupe 锁，只为让「任务」页显示的是清理而不是同步。
+// 清理会动文件，尤其本地清的是下载目录，所以进程内三把锁一起拿：
+// - sync：云端清的是同步的目标文件夹
+// - alist：本地清的是 downloadDir，AList 下载正往这里写
+// - dedupe：让「任务」页显示的是清理而不是同步
+// 顺序固定为 sync → alist → dedupe，与 runSyncThenDownload 的 sync → alist 一致，不会死锁。
+// 注意 withTaskLock 只是**进程内**互斥；跨进程靠 CLI 那侧的锁文件（见 dedupeMode）。
 export async function runDedupe(config, opts = {}) {
-  return withTaskLock('sync', () => withTaskLock('dedupe', () => dedupeInternal(config ?? loadConfig(), opts)));
+  return withTaskLock('sync', () => withTaskLock('alist', () => withTaskLock('dedupe',
+    () => dedupeInternal(config ?? loadConfig(), opts))));
 }
 
 async function dedupeMode(apply, opts = {}) {
   log('=== 夸克网盘重复副本清理 ===\n');
   const config = loadConfigOrExit();
+
+  // CLI 侧再加跨进程文件锁：本地清的是下载目录，别的实例（另一个终端 / 容器）可能正在下载。
+  // 锁名与 downloadMode / alistMode 保持一致，才真的互斥；拿不到就按既有 CLI 语义直接退出。
+  // 只清云端时不必占用下载锁，也不该在没配 downloadDir 时往项目目录里写锁文件。
+  // 只有真的要删时才需要这些锁：预览不改任何文件，也不该顺手建目录、写锁文件
+  const dir = String(config.downloadDir || '').trim();
+  if (apply && opts.local !== false && dir) {
+    const saveDir = path.resolve(dir);
+    if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+    acquireLock('.download.lock', saveDir);
+    acquireLock('.alist.lock', saveDir);
+  }
+
   await runDedupe(config, { apply, ...opts });
   if (!apply) log('\n提示: 确认清单无误后执行删除：npm run dedupe-apply（或 node src/index.js dedupe --yes）\n');
 }
