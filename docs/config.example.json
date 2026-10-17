@@ -25,6 +25,7 @@
   "maxFilesPerShare": 0,
   "pollInterval": 1000,
   "pruneDeadShares": false,
+  "folderPerShow": false,
   "webPort": 3000,
   "webToken": "",
   "webHost": "0.0.0.0"

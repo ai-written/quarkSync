@@ -279,6 +279,11 @@
                 <input type="checkbox" id="dedupEpisodesInTarget">
                 <span class="hint">目标文件夹里已有同一集时不再转存：重传后体积变了一点、或已被加过 <code>(2)(3)</code> 序号、或写成 <code>S01E07</code> 与 <code>07</code> 这类不同命名，都算同一集。关掉后每次同步都可能多转一份重复。</span>
               </div>
+              <label>按影视名称分文件夹</label>
+              <div>
+                <input type="checkbox" id="folderPerShow">
+                <span class="hint">转存到「目标文件夹/影视名称/原名」（不再往文件名加前缀），下载时在本地重建同样的文件夹结构；清理重复副本时按文件夹分别去重，并删掉变空的影视名称文件夹。开启后首次「清理重复副本（预览）」会列出旧平铺文件的迁移清单，确认执行后才会移动。</span>
+              </div>
             </div>
           </div>
 
@@ -761,6 +766,8 @@ async function loadConfig() {
   $('downloadAfterSync').checked = c.downloadAfterSync === true;
   // 未设置时默认启用（与后端 config.dedupEpisodesInTarget !== false 一致）
   $('dedupEpisodesInTarget').checked = c.dedupEpisodesInTarget !== false;
+  // 未设置时默认关闭（与后端 config.folderPerShow === true 一致）
+  $('folderPerShow').checked = c.folderPerShow === true;
 
   const su = c.shareUrls ?? (c.shareUrl ? [c.shareUrl] : []);
   renderShares(su);
@@ -822,6 +829,7 @@ $('saveBtn').onclick = async () => {
   out.pruneDeadShares = $('pruneDeadShares').checked;
   out.downloadAfterSync = $('downloadAfterSync').checked;
   out.dedupEpisodesInTarget = $('dedupEpisodesInTarget').checked;
+  out.folderPerShow = $('folderPerShow').checked;
   out.webHost = $('webHost').value;
 
   const sc = inputToCron($('syncCron').value);

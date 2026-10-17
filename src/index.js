@@ -488,37 +488,64 @@ function saveDownloadedRecord(saveDir, record) {
   fs.writeFileSync(fp, JSON.stringify(Object.fromEntries(record), null, 2), 'utf-8');
 }
 
-function cleanupLocalFiles(saveDir, maxAgeDays) {
+// 清理过期文件。folders=true（folderPerShow 开启）时连同 downloadDir 的一级子目录一起清；
+// 否则保持旧行为只清当层，不动任何子目录。
+function cleanupLocalFiles(saveDir, maxAgeDays, { folders = false, folderNames = null } = {}) {
   if (!maxAgeDays || maxAgeDays <= 0) return { deleted: 0, skipped: 0 };
   if (!fs.existsSync(saveDir)) return { deleted: 0, skipped: 0 };
 
   const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-  const entries = fs.readdirSync(saveDir);
   let deleted = 0, skipped = 0;
   const downloadedRecord = loadDownloadedRecord(saveDir);
   let recordChanged = false;
 
-  for (const name of entries) {
-    const fp = path.join(saveDir, name);
-    try {
-      const stat = fs.statSync(fp);
-      if (stat.isDirectory()) continue;
-      if (name === DOWNLOADED_FILE) continue;
-      if (stat.mtimeMs < cutoff) {
-        fs.unlinkSync(fp);
-        deleted++;
-        log(`   🗑 清理旧文件: ${name}`);
-        const epKey = getEpisodeKey(name);
-        for (const [key] of downloadedRecord) {
-          if (key.startsWith(`${name}|`) || (epKey && key === epKey)) {
-            downloadedRecord.delete(key);
-            recordChanged = true;
-          }
-        }
-      } else {
-        skipped++;
+  const dropRecordKeys = (name, relDir) => {
+    const epKey = getEpisodeKey(name);
+    const dirPrefix = relDir ? `dir:${relDir}|` : '';
+    for (const [key] of downloadedRecord) {
+      if (relDir && !key.startsWith(dirPrefix)) continue;
+      const bare = dirPrefix ? key.slice(dirPrefix.length) : key;
+      if (bare.startsWith(`${name}|`) || (epKey && bare === epKey)) {
+        downloadedRecord.delete(key);
+        recordChanged = true;
       }
+    }
+  };
+
+  // 按文件夹清理：当层 + 一级子目录（分文件夹后旧文件都在影视名称文件夹里）。
+  // 不再往下递归：更深层是用户自己放的东西，不做处理。
+  const cleanDir = (dirPath, relDir) => {
+    let names;
+    try { names = fs.readdirSync(dirPath); } catch { return; }
+    for (const name of names) {
+      const fp = path.join(dirPath, name);
+      try {
+        const stat = fs.statSync(fp);
+        if (stat.isDirectory()) continue;
+        if (name === DOWNLOADED_FILE) continue;
+        if (stat.mtimeMs < cutoff) {
+          fs.unlinkSync(fp);
+          deleted++;
+          log(`   🗑 清理旧文件: ${relDir ? `${relDir}/` : ''}${name}`);
+          dropRecordKeys(name, relDir);
+        } else {
+          skipped++;
+        }
+      } catch {}
+    }
+  };
+
+  cleanDir(saveDir, '');
+  if (folders) {
+    let subDirs = [];
+    try {
+      subDirs = fs.readdirSync(saveDir, { withFileTypes: true })
+        .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+        // folderNames 非空时只清影视名称文件夹，用户自己建的子目录不动
+        .filter(e => !folderNames || folderNames.has(e.name))
+        .map(e => e.name);
     } catch {}
+    for (const name of subDirs) cleanDir(path.join(saveDir, name), name);
   }
 
   if (recordChanged) {
@@ -1346,7 +1373,7 @@ export function localCopyIsComplete(saveDir, name, expectedSize, localIndex = nu
   return buildLocalEpisodeIndex(saveDir).has(key);
 }
 
-class QuarkClient {
+export class QuarkClient {
   constructor(cookie) {
     this.base = 'https://drive-pc.quark.cn';
     this.shareBase = 'https://drive.quark.cn';
@@ -1470,6 +1497,52 @@ class QuarkClient {
     return data.data?.fid;
   }
 
+  // 只列当层条目（文件 + 文件夹）。folderPerShow 需要用目录条目来分文件夹，
+  // listTopLevelFiles 只返回文件、listAllUserFiles 会递归，都不合适。
+  async listTopLevelEntries(pdirFid = '0') {
+    const out = [];
+    let page = 1;
+    let seen = 0;
+    while (true) {
+      const { list, total } = await this.listUserFiles(pdirFid, page);
+      out.push(...list);
+      seen += list.length;
+      if (list.length === 0 || list.length < 100 || (total && seen >= total)) break;
+      page++;
+    }
+    return out;
+  }
+
+  // 「影视名称」子文件夹：存在就复用，不存在则创建（试运行只查找、不创建）。
+  async ensureSubfolder(pdirFid, name, { dryRun = false } = {}) {
+    const parent = pdirFid || '0';
+    const existing = await this.findFolderByName(name, parent);
+    if (existing) return existing;
+    if (dryRun) return null;
+    try {
+      const fid = await this.createFolder(name, parent);
+      if (fid) return fid;
+    } catch (e) {
+      // 并发/重名时创建接口可能报错，但文件夹其实已经建好：再查一次
+      const again = await this.findFolderByName(name, parent);
+      if (again) return again;
+      throw e;
+    }
+    const again = await this.findFolderByName(name, parent);
+    if (!again) throw new Error(`创建文件夹失败: ${name}`);
+    return again;
+  }
+
+  // 移动文件/文件夹（旧文件迁移到影视名称文件夹用）。夸克这个接口是异步任务，
+  // 这里只保证请求被接受；真实结果由后续列目录佐证（迁移失败时下轮会重试）。
+  async moveFiles(fids, toPdirFid) {
+    const url = `${this.base}/1/clouddrive/file/move?pr=ucpro&fr=pc&uc_param_str=&__dt=${dt()}&__t=${ts13()}`;
+    const data = await this._post(url, { filelist: fids, to_pdir_fid: toPdirFid || '0', exclude_fids: [] });
+    if (data.status !== 200 && data.code !== 0) {
+      throw new Error(`移动失败: ${data.message || JSON.stringify(data).substring(0, 200)}`);
+    }
+  }
+
   async renameFile(fid, newName) {
     const url = `${this.base}/1/clouddrive/file/rename?pr=ucpro&fr=pc&uc_param_str=&__dt=${dt()}&__t=${ts13()}`;
     const data = await this._post(url, { fid, file_name: newName });
@@ -1585,69 +1658,110 @@ class QuarkClient {
     return { deleted };
   }
 
-  async downloadAllFromFolder(pdirFid, saveDir, skipExisting = true, deleteAfter = false) {
+  // 下载分组：当层文件一组，每个子文件夹一组（folderPerShow 创建的「影视名称」文件夹）。
+  // 组内做同集去重与跳过判定，不同剧的同名文件不会互相干扰；组的 relDir 就是本地子目录。
+  // flatten=true（未开启 folderPerShow）时保持旧行为：递归列出全部文件、平铺下载。
+  async collectDownloadGroups(pdirFid, { flatten = false } = {}) {
+    if (flatten) {
+      const files = await this.listAllUserFiles(pdirFid);
+      return files.length > 0 ? [{ relDir: '', files }] : [];
+    }
+    const entries = await this.listTopLevelEntries(pdirFid);
+    const groups = [];
+    const baseFiles = entries.filter(e => !e.dir);
+    if (baseFiles.length > 0) groups.push({ relDir: '', files: baseFiles });
+    for (const d of entries) {
+      if (!d.dir) continue;
+      const files = await this.listAllUserFiles(d.fid);
+      if (files.length > 0) groups.push({ relDir: d.file_name, files });
+    }
+    return groups;
+  }
+
+  async downloadAllFromFolder(pdirFid, saveDir, skipExisting = true, deleteAfter = false, { flatten = false } = {}) {
     log(`   列出目标文件夹中的文件...`);
-    let files = await this.listAllUserFiles(pdirFid);
-    const rawCount = files.length;
-    files = deduplicateByEpisode(files, { onSkip: log });
-    if (files.length < rawCount) {
-      log(`   ✓ 共 ${rawCount} 个文件 (去重后 ${files.length} 个)\n`);
+    const groups = await this.collectDownloadGroups(pdirFid, { flatten });
+    const rawCount = groups.reduce((n, g) => n + g.files.length, 0);
+    if (rawCount === 0) {
+      log(`   目标文件夹是空的，无需下载。`);
+      return;
+    }
+    // 每组单独去重：分文件夹后不同剧的「08.mkv」不能被当成同一集
+    let dedupedCount = 0;
+    const plans = groups.map(g => {
+      const deduped = deduplicateByEpisode(g.files, {
+        onSkip: msg => log(g.relDir ? `   [${g.relDir}]${msg}` : msg),
+      });
+      dedupedCount += deduped.length;
+      return { ...g, files: deduped };
+    });
+    if (dedupedCount < rawCount) {
+      log(`   ✓ 共 ${rawCount} 个文件 (去重后 ${dedupedCount} 个)\n`);
     } else {
-      log(`   ✓ 共 ${files.length} 个文件\n`);
+      log(`   ✓ 共 ${rawCount} 个文件\n`);
     }
 
     const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
-    // 预先算一次：清理重复副本改过名时，靠它按「同一集 + 同体积」认出本地那份
-    const localIndex = skipExisting ? buildLocalEpisodeIndex(saveDir) : null;
     let incomplete = 0;
-    const toDownload = skipExisting
-      ? files.filter(f => {
-        if (!downloadedRecord.has(getDedupKey(f))) return true;
-        // 有记录也要确认本地那份是完整的，否则重新下载（自愈被截断的半成品）
-        if (localCopyIsComplete(saveDir, f.file_name, f.size, localIndex)) return false;
-        incomplete++;
-        return true;
-      })
-      : files;
+    // 先把每组要下什么算出来，保持「待下载 / 跳过」的日志在真正下载之前
+    const work = plans.map(plan => {
+      const destDir = plan.relDir ? path.join(saveDir, plan.relDir) : saveDir;
+      // 本地索引按组单独建：同名集数只在同一部剧内比较，
+      // 兼容清理重复副本改过名的情况（改名不等于没下过）
+      const localIndex = skipExisting ? buildLocalEpisodeIndex(destDir) : null;
+      const toDownload = skipExisting
+        ? plan.files.filter(f => {
+          const key = downloadRecordKey(f.file_name, plan.relDir);
+          if (!downloadedRecord.has(key)) return true;
+          // 有记录也要确认本地那份是完整的，否则重新下载（自愈被截断的半成品）
+          if (localCopyIsComplete(destDir, f.file_name, f.size, localIndex)) return false;
+          incomplete++;
+          return true;
+        })
+        : plan.files;
+      return { ...plan, destDir, toDownload };
+    });
     if (incomplete > 0) {
       log(`   ⚠ 有 ${incomplete} 个文件本地副本缺失或大小不符，将重新下载`);
     }
-
-    if (toDownload.length === 0) {
+    const totalToDownload = work.reduce((n, w) => n + w.toDownload.length, 0);
+    if (totalToDownload === 0) {
       log(`   所有文件已下载过，无需下载。`);
       return;
     }
-
-    const skipped = files.length - toDownload.length;
-    log(`   待下载: ${toDownload.length} 个 (跳过 ${skipped} 个已下载记录)\n`);
+    log(`   待下载: ${totalToDownload} 个 (跳过 ${dedupedCount - totalToDownload} 个已下载记录)\n`);
 
     const batchSize = 10;
     let downloaded = 0;
     const downloadedFids = [];
     const downloadedNames = [];
-    for (let i = 0; i < toDownload.length; i += batchSize) {
-      const batch = toDownload.slice(i, i + batchSize);
-      const fids = batch.map(f => f.fid);
-      const range = `${i + 1}-${Math.min(i + batchSize, toDownload.length)}`;
-      let urls;
-      try {
-        urls = await this.getDownloadUrls(fids);
-      } catch (e) {
-        log(`   ✗ 获取下载地址失败 (${range}): ${e.message}`);
-        continue;
-      }
-      const success = await this.downloadFilesParallel(urls, saveDir, 3);
-      downloaded += success.length;
-      downloadedFids.push(...success.map(s => s.fid));
-      downloadedNames.push(...success.map(s => s.file_name));
-      if (skipExisting) {
-        for (const s of success) {
-          downloadedRecord.set(getDedupKey(s), true);
+    for (const w of work) {
+      if (w.toDownload.length === 0) continue;
+      if (w.relDir) fs.mkdirSync(w.destDir, { recursive: true });
+      for (let i = 0; i < w.toDownload.length; i += batchSize) {
+        const batch = w.toDownload.slice(i, i + batchSize);
+        const fids = batch.map(f => f.fid);
+        const range = `${i + 1}-${Math.min(i + batchSize, w.toDownload.length)}`;
+        let urls;
+        try {
+          urls = await this.getDownloadUrls(fids);
+        } catch (e) {
+          log(`   ✗ 获取下载地址失败${w.relDir ? ` [${w.relDir}]` : ''} (${range}): ${e.message}`);
+          continue;
         }
-        saveDownloadedRecord(saveDir, downloadedRecord);
+        const success = await this.downloadFilesParallel(urls, w.destDir, 3);
+        downloaded += success.length;
+        downloadedFids.push(...success.map(s => s.fid));
+        downloadedNames.push(...success.map(s => (w.relDir ? `${w.relDir}/${s.file_name}` : s.file_name)));
+        if (skipExisting) {
+          for (const s of success) {
+            downloadedRecord.set(downloadRecordKey(s.file_name, w.relDir), true);
+          }
+          saveDownloadedRecord(saveDir, downloadedRecord);
+        }
       }
     }
-    log(`\n   下载完成: ${downloaded}/${toDownload.length} 个`);
+    log(`\n   下载完成: ${downloaded}/${totalToDownload} 个`);
     if (downloadedNames.length > 0) {
       log('   已下载的文件列表:');
       for (const name of downloadedNames) log(`     ✓ ${name}`);
@@ -1918,6 +2032,54 @@ export function normalizePrefix(tip) {
   return tip.endsWith('-') ? tip : `${tip}-`;
 }
 
+// 影视名称 → 文件夹名：去掉路径分隔符与 Windows 非法字符，空白折叠，去掉首尾点/空格。
+// 返回空串表示不能用作文件夹名（调用方回退到平铺）。
+export function showFolderName(tip) {
+  const s = String(tip ?? '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .replace(/^[.\s]+|[.\s]+$/g, '')
+    .trim();
+  return s.length > 100 ? s.slice(0, 100).trim() : s;
+}
+
+// folderPerShow 开启后，文件夹已表示剧名，文件名里不再需要「影视名称-」前缀。
+// 迁移旧文件、以及分享里的文件本来就带前缀时，用它剥成原名。
+export function stripShowPrefix(fileName, tip) {
+  const name = String(fileName ?? '');
+  const prefix = normalizePrefix(tip);
+  if (!prefix) return name;
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
+
+// .downloaded.json 的记录键：分文件夹后不同剧可能有同名文件（如 08.mkv），
+// 必须带上相对目录；根目录沿用旧键，升级前的记录仍然有效。
+export function downloadRecordKey(fileName, relDir = '') {
+  const base = getDedupKey({ file_name: fileName });
+  const dir = String(relDir || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  return dir ? `dir:${dir}|${base}` : base;
+}
+
+// 把平铺文件按「影视名称-」前缀规划到对应文件夹（folderPerShow 的旧文件迁移用）。
+// 返回 [{ file, tip, folder, newName }]；前缀互相包含时优先更长的，避免「遮天」抢走「遮天2-」。
+// 导出仅为测试用。
+export function planFolderMigration(files, tips) {
+  const prefixes = [...new Set((tips || []).map(t => normalizePrefix(t)).filter(Boolean))]
+    .sort((a, b) => b.length - a.length);
+  const out = [];
+  for (const f of files) {
+    const name = f.file_name || f.name || '';
+    const prefix = prefixes.find(p => name.startsWith(p));
+    if (!prefix) continue;
+    const tip = prefix.endsWith('-') ? prefix.slice(0, -1) : prefix;
+    const folder = showFolderName(tip);
+    const newName = name.slice(prefix.length);
+    if (!folder || !newName) continue;
+    out.push({ file: f, tip, folder, newName });
+  }
+  return out;
+}
+
 // 改名重试：夸克的改名接口偶发 `404 / code 14014 "illegal text"` 这类瞬时错误 ——
 // 转存任务刚报完成时，文件在改名接口那侧可能还没就绪（线上真的遇到过，一次失败就永久没前缀）。
 // 退避重试仍失败，再按 fid 复核一次：那个 fid 的文件名已经变成目标名，说明其实改成功了
@@ -2054,6 +2216,29 @@ export function buildFileLines(files, { prefix = '' } = {}) {
   });
 }
 
+// folderPerShow：收集「这个分享要对比的已有文件」。两类都算：
+// - 影视名称文件夹里的文件：文件名没有前缀，比对前补回前缀，沿用原来的同集判定
+// - 迁移前还平铺在目标文件夹根下的旧文件：本身带「影视名称-」前缀，原样参与
+// 这样开启分文件夹后，即使旧文件还没迁移也不会重复转存。
+export async function collectExistingForShare(client, { baseFid, folderFid, prefix, folderPerShow }) {
+  if (!folderPerShow || !prefix) {
+    return baseFid ? await client.listAllUserFiles(baseFid) : [];
+  }
+  const files = [];
+  if (folderFid) {
+    for (const f of await client.listAllUserFiles(folderFid)) {
+      const name = String(f.file_name || '');
+      files.push({ ...f, file_name: name.startsWith(prefix) ? name : `${prefix}${name}` });
+    }
+  }
+  if (baseFid) {
+    for (const e of await client.listTopLevelEntries(baseFid)) {
+      if (!e.dir && String(e.file_name || '').startsWith(prefix)) files.push(e);
+    }
+  }
+  return files;
+}
+
 // 统一同步实现：CLI(sync 模式) 与 cron/网页触发共用同一份逻辑
 async function syncInternal(config, opts = {}) {
   const { dryRun = false } = opts;
@@ -2094,6 +2279,9 @@ async function syncInternal(config, opts = {}) {
   log('1. 确定保存目标文件夹...');
   // 试运行时只查找、不创建：目录尚不存在会返回 null，表示正式运行时会创建它
   const targetDirFid = await client.resolveTargetDir(config, { dryRun });
+  // 按影视名称分文件夹：转存到「目标文件夹/影视名称/原名」，下载时保持同样结构
+  const folderPerShow = config.folderPerShow === true;
+  const showFolderCache = new Map();
 
   let totalSuccess = 0;
   let totalFailed = 0;
@@ -2198,9 +2386,34 @@ async function syncInternal(config, opts = {}) {
         continue;
       }
 
+      // 按影视名称分文件夹：先定位/创建该分享的文件夹（试运行只查找、不创建）
+      let shareDirFid = targetDirFid;
+      let shareFolder = '';
+      if (folderPerShow && shareTip) {
+        shareFolder = showFolderName(shareTip);
+        if (shareFolder && targetDirFid !== null) {
+          if (showFolderCache.has(shareFolder)) {
+            shareDirFid = showFolderCache.get(shareFolder);
+          } else {
+            shareDirFid = await client.ensureSubfolder(targetDirFid, shareFolder, { dryRun });
+            showFolderCache.set(shareFolder, shareDirFid);
+          }
+          if (!shareDirFid && !dryRun) throw new Error(`无法定位/创建影视名称文件夹: ${shareFolder}`);
+          log(`   存放目录: ${shareFolder}/`);
+        } else if (shareFolder) {
+          shareDirFid = null;
+          log(`   存放目录: ${shareFolder}/（目标文件夹尚不存在，正式运行时会创建）`);
+        }
+      }
+
       log('   检查目标文件夹中已存在的文件...');
       // 试运行且目标文件夹尚不存在时无从比对，视为空目录（正式运行时它会是新建的空目录）
-      const existingFiles = targetDirFid ? await client.listAllUserFiles(targetDirFid) : [];
+      const existingFiles = await collectExistingForShare(client, {
+        baseFid: targetDirFid,
+        folderFid: shareFolder && shareDirFid && shareDirFid !== targetDirFid ? shareDirFid : null,
+        prefix: shareTip ? normalizePrefix(shareTip) : '',
+        folderPerShow: Boolean(shareFolder),
+      });
       const existingMap = new Map(existingFiles.map(f => [`${f.file_name}|${f.size || ''}`, true]));
       // 「同一集是否已经转过」的索引：只看文件名，不看体积。
       // 只按「名称|大小」比对时，上游重新压制/重传（体积差几 MB）或已被加过序号副本的文件
@@ -2238,22 +2451,24 @@ async function syncInternal(config, opts = {}) {
       }
 
       // 试运行：不在这里打印（进度已静音），改为收集起来，函数末尾一次性输出
-      // 前缀一并传进去：清单里给的是加完前缀的最终文件名，而不是分享里的原始名
+      // 分文件夹时文件名不加上前缀（文件夹就是剧名）；平铺时仍按加前缀后的最终名列出
+      const namePrefix = shareFolder ? '' : shareTip;
       if (dryRun) {
         dryRunWouldTransfer += newFiles.length;
         dryRunEntries.push({
           label: shareTip || pwdIds[0] || `第 ${si + 1} 个分享`,
-          lines: buildFileLines(newFiles, { prefix: shareTip }),
+          lines: buildFileLines(newFiles, { prefix: namePrefix }),
         });
         continue;
       }
 
       log('待转存文件列表:');
-      for (const line of buildFileLines(newFiles, { prefix: shareTip })) log(line);
+      for (const line of buildFileLines(newFiles, { prefix: namePrefix })) log(line);
       log('');
 
-      log('4. 开始转存文件到自己的网盘...');
-      const results = await client.saveFilesInBatches(pwdId, stoken, newFiles, targetDirFid, pollInterval);
+      const transferDirFid = shareDirFid || targetDirFid;
+      log(`4. 开始转存文件到自己的网盘...${shareFolder ? ` (${shareFolder}/)` : ''}`);
+      const results = await client.saveFilesInBatches(pwdId, stoken, newFiles, transferDirFid, pollInterval);
       log('');
 
       log('=== 本分享转存结果 ===');
@@ -2269,7 +2484,10 @@ async function syncInternal(config, opts = {}) {
         for (const name of results.success) log(`  ✓ ${name}`);
       }
 
-      const renamedNames = await applyNamePrefix(client, targetDirFid, results.success, shareTip);
+      // 分文件夹时文件名保持原名，不再加「影视名称-」前缀；平铺时维持原有行为
+      const renamedNames = shareFolder
+        ? results.success
+        : await applyNamePrefix(client, transferDirFid, results.success, shareTip);
 
       totalSuccess += results.success.length;
       totalFailed += results.failed.length;
@@ -2363,7 +2581,7 @@ async function syncInternal(config, opts = {}) {
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
     const cloudResult = await client.cleanupOldFiles(targetDirFid, config.cleanupAfterDays);
-    const localResult = cleanupLocalFiles(path.resolve(config.downloadDir || '.'), config.cleanupAfterDays);
+    const localResult = cleanupLocalFiles(path.resolve(config.downloadDir || '.'), config.cleanupAfterDays, { folders: config.folderPerShow === true, folderNames: config.folderPerShow === true ? configShowFolders(config) : null });
     // 无论有没有删除都要给出结论：否则只剩一行标题，
     // 无法区分「跑过了但没东西可删」和「中途失败/被跳过」
     if (cloudResult.deleted === 0) log('   网盘: 没有超过保留期的文件');
@@ -2436,11 +2654,12 @@ async function downloadMode(forceDownload = false) {
 
   log('2. 开始下载...');
   const skipExisting = !forceDownload;
-  await client.downloadAllFromFolder(targetDirFid, saveDir, skipExisting, config.deleteAfterDownload);
+  await client.downloadAllFromFolder(targetDirFid, saveDir, skipExisting, config.deleteAfterDownload,
+    { flatten: config.folderPerShow !== true });
 
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
-    const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+    const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays, { folders: config.folderPerShow === true, folderNames: config.folderPerShow === true ? configShowFolders(config) : null });
     log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
   }
 }
@@ -2524,68 +2743,112 @@ class AlistClient {
     await this._post('fs/remove', { names: [name], dir: dir || '/' });
   }
 
-  async downloadDir(alistPath, saveDir, skipExisting = true, deleteAfter = false) {
+  // 与夸克侧一致：当层文件一组，每个一级子文件夹一组，下载到本地同名子目录。
+  // 组内单独做同集去重，不同剧的同名文件不会互相干扰。
+  // flatten=true（未开启 folderPerShow）时保持旧行为：递归列出全部文件、平铺下载。
+  async collectDownloadGroups(alistPath, { flatten = false } = {}) {
+    if (flatten) {
+      const files = await this.listAllFiles(alistPath);
+      return files.length > 0 ? [{ relDir: '', files }] : [];
+    }
+    const first = await this.listDir(alistPath);
+    let content = Array.isArray(first.content) ? first.content : [];
+    if ((first.total || 0) > content.length) {
+      const more = await this.listDir(alistPath, 2, first.total);
+      content = content.concat(Array.isArray(more.content) ? more.content : []);
+    }
+    const groups = [];
+    const files = content.filter(i => !i.is_dir).map(i => ({
+      name: i.name,
+      size: i.size,
+      path: `${alistPath}/${i.name}`,
+    }));
+    if (files.length > 0) groups.push({ relDir: '', files });
+    for (const d of content.filter(i => i.is_dir)) {
+      const sub = await this.listAllFiles(`${alistPath}/${d.name}`);
+      if (sub.length > 0) groups.push({ relDir: d.name, files: sub });
+    }
+    return groups;
+  }
+
+  async downloadDir(alistPath, saveDir, skipExisting = true, deleteAfter = false, { flatten = false } = {}) {
     log(`   列出文件夹: ${alistPath} ...`);
-    let files = await this.listAllFiles(alistPath);
-    const rawCount = files.length;
-    files = deduplicateByEpisode(files, { onSkip: log });
-    if (files.length < rawCount) {
-      log(`   ✓ 共 ${rawCount} 个文件 (去重后 ${files.length} 个)\n`);
+    const groups = await this.collectDownloadGroups(alistPath, { flatten });
+    const rawCount = groups.reduce((n, g) => n + g.files.length, 0);
+    if (rawCount === 0) {
+      log(`   文件夹是空的，无需下载。`);
+      return;
+    }
+    let dedupedCount = 0;
+    const plans = groups.map(g => {
+      const deduped = deduplicateByEpisode(g.files, {
+        onSkip: msg => log(g.relDir ? `   [${g.relDir}]${msg}` : msg),
+      });
+      dedupedCount += deduped.length;
+      return { ...g, files: deduped };
+    });
+    if (dedupedCount < rawCount) {
+      log(`   ✓ 共 ${rawCount} 个文件 (去重后 ${dedupedCount} 个)\n`);
     } else {
-      log(`   ✓ 共 ${files.length} 个文件\n`);
+      log(`   ✓ 共 ${dedupedCount} 个文件\n`);
     }
 
     const downloadedRecord = skipExisting ? loadDownloadedRecord(saveDir) : new Map();
-    // 预先算一次：清理重复副本改过名时，靠它按「同一集 + 同体积」认出本地那份
-    const localIndex = skipExisting ? buildLocalEpisodeIndex(saveDir) : null;
     let incomplete = 0;
-    const toDownload = skipExisting
-      ? files.filter(f => {
-        if (!downloadedRecord.has(getDedupKey(f))) return true;
-        // 有记录也要确认本地那份是完整的，否则重新下载（自愈被截断的半成品）
-        if (localCopyIsComplete(saveDir, f.name, f.size, localIndex)) return false;
-        incomplete++;
-        return true;
-      })
-      : files;
+    const work = plans.map(plan => {
+      const destDir = plan.relDir ? path.join(saveDir, plan.relDir) : saveDir;
+      const localIndex = skipExisting ? buildLocalEpisodeIndex(destDir) : null;
+      const toDownload = skipExisting
+        ? plan.files.filter(f => {
+          const key = downloadRecordKey(f.name, plan.relDir);
+          if (!downloadedRecord.has(key)) return true;
+          if (localCopyIsComplete(destDir, f.name, f.size, localIndex)) return false;
+          incomplete++;
+          return true;
+        })
+        : plan.files;
+      return { ...plan, destDir, toDownload };
+    });
     if (incomplete > 0) {
       log(`   ⚠ 有 ${incomplete} 个文件本地副本缺失或大小不符，将重新下载`);
     }
-
-    if (toDownload.length === 0) {
+    const totalToDownload = work.reduce((n, w) => n + w.toDownload.length, 0);
+    if (totalToDownload === 0) {
       log(`   所有文件已下载过，无需下载。`);
       return;
     }
-
-    const skipped = files.length - toDownload.length;
-    log(`   待下载: ${toDownload.length}/${files.length} 个 (跳过 ${skipped} 个已下载记录)\n`);
+    log(`   待下载: ${totalToDownload}/${dedupedCount} 个 (跳过 ${dedupedCount - totalToDownload} 个已下载记录)\n`);
 
     const concurrency = 3;
-    const queue = [...toDownload];
     let completed = 0;
     const successPaths = [];
     const successNames = [];
-    const worker = async () => {
-      while (queue.length > 0) {
-        const f = queue.shift();
-        const savePath = path.join(saveDir, f.name);
-        try {
-          // 传入列表里声明的文件大小，下载后据此校验是否被截断
-          await this.downloadFile(f.path, savePath, f.size || 0);
-          completed++;
-          successPaths.push(f.path);
-          successNames.push(f.name);
-          if (skipExisting) {
-            downloadedRecord.set(getDedupKey(f), true);
-            saveDownloadedRecord(saveDir, downloadedRecord);
+    for (const w of work) {
+      if (w.toDownload.length === 0) continue;
+      if (w.relDir) fs.mkdirSync(w.destDir, { recursive: true });
+      const queue = [...w.toDownload];
+      const worker = async () => {
+        while (queue.length > 0) {
+          const f = queue.shift();
+          const savePath = path.join(w.destDir, f.name);
+          try {
+            // 传入列表里声明的文件大小，下载后据此校验是否被截断
+            await this.downloadFile(f.path, savePath, f.size || 0);
+            completed++;
+            successPaths.push(f.path);
+            successNames.push(w.relDir ? `${w.relDir}/${f.name}` : f.name);
+            if (skipExisting) {
+              downloadedRecord.set(downloadRecordKey(f.name, w.relDir), true);
+              saveDownloadedRecord(saveDir, downloadedRecord);
+            }
+          } catch (e) {
+            log(`   ✗ ${w.relDir ? `${w.relDir}/` : ''}${f.name}: ${e.message}`);
           }
-        } catch (e) {
-          log(`   ✗ ${f.name}: ${e.message}`);
         }
-      }
-    };
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
-    log(`\n   下载完成: ${completed}/${toDownload.length} 个`);
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    }
+    log(`\n   下载完成: ${completed}/${totalToDownload} 个`);
     if (successNames.length > 0) {
       log('   已下载的文件列表:');
       for (const name of successNames) log(`     ✓ ${name}`);
@@ -2756,12 +3019,13 @@ async function alistInternal(config, { skipExisting = true } = {}) {
   log(`路径: ${alistPath}`);
   log(`保存到: ${saveDir}\n`);
   const client = new AlistClient(alistUrl, config.alistToken, config.alistRefresh);
-  await client.downloadDir(alistPath, saveDir, skipExisting, config.deleteAfterDownload);
+  await client.downloadDir(alistPath, saveDir, skipExisting, config.deleteAfterDownload,
+    { flatten: config.folderPerShow !== true });
   log(`   AList下载完成`);
 
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`   执行本地清理 (${config.cleanupAfterDays}天前的文件)...`);
-    const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays);
+    const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays, { folders: config.folderPerShow === true, folderNames: config.folderPerShow === true ? configShowFolders(config) : null });
     log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
   }
 }
@@ -2774,7 +3038,11 @@ async function alistInternal(config, { skipExisting = true } = {}) {
 
 // 本地下载目录里的重复：同一集留一份。返回 { sets, kept, deleted }。
 // apply=false 时只统计不删（供预览）。导出仅为测试用。
-export function cleanupLocalDuplicates(saveDir, { apply = false } = {}) {
+// 本地清理：downloadDir 当层文件一组；folderPerShow 开启时，每个一级子文件夹
+// （影视名称文件夹）各自一组。不同剧的同名集数不跨文件夹比较；
+// 删完后把变空的子文件夹也删掉。
+// folderNames 非空时只处理这些目录（当前配置里的影视名称），不动用户自己建的其它子目录。
+export function cleanupLocalDuplicates(saveDir, { apply = false, folders = false, folderNames = null } = {}) {
   let entries;
   try {
     entries = fs.readdirSync(saveDir, { withFileTypes: true });
@@ -2782,43 +3050,104 @@ export function cleanupLocalDuplicates(saveDir, { apply = false } = {}) {
     throw new Error(`无法读取本地目录 ${saveDir}: ${e.message}`);
   }
 
-  const files = [];
-  for (const e of entries) {
-    // 跳过点文件（.downloaded.json）与下载中的 .part 半成品：半成品体积可能比正常文件
-    // 还大，混进分组会把真正完好的那份当成「多余的」删掉
-    if (!e.isFile() || e.name.startsWith('.') || e.name.endsWith('.part')) continue;
-    const full = path.join(saveDir, e.name);
-    let stat;
-    try { stat = fs.statSync(full); } catch { continue; }
-    files.push({ name: e.name, size: stat.size, updated_at: stat.mtimeMs, full });
+  const readFiles = (dirPath, relDir) => {
+    let sub;
+    try { sub = fs.readdirSync(dirPath, { withFileTypes: true }); } catch { return []; }
+    const out = [];
+    for (const e of sub) {
+      // 跳过点文件（.downloaded.json）与下载中的 .part 半成品：半成品体积可能比正常文件
+      // 还大，混进分组会把真正完好的那份当成「多余的」删掉
+      if (!e.isFile() || e.name.startsWith('.') || e.name.endsWith('.part')) continue;
+      const full = path.join(dirPath, e.name);
+      let stat;
+      try { stat = fs.statSync(full); } catch { continue; }
+      out.push({ name: e.name, size: stat.size, updated_at: stat.mtimeMs, full, relDir });
+    }
+    return out;
+  };
+
+  const containers = [{ relDir: '', dirPath: saveDir, files: readFiles(saveDir, '') }];
+  if (folders) {
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      // 只处理当前配置里的影视名称文件夹；其它子目录（用户自己放的）不碰
+      if (folderNames && !folderNames.has(e.name)) continue;
+      const dirPath = path.join(saveDir, e.name);
+      containers.push({ relDir: e.name, dirPath, files: readFiles(dirPath, e.name) });
+    }
   }
 
-  const { sets, skipped } = findDuplicateSets(files);
+  const sets = [];
+  const skipped = [];
   const deleted = [];
   const failed = [];
-  for (const s of sets) {
-    for (const f of s.drop) {
-      if (!apply) { deleted.push(f); continue; }
-      try {
-        fs.unlinkSync(f.full);
-        deleted.push(f);
-      } catch (e) {
-        failed.push(`${f.name}: ${e.message}`);
+  const foldersRemoved = [];
+  let scanned = 0;
+  for (const c of containers) {
+    scanned += c.files.length;
+    const r = findDuplicateSets(c.files);
+    for (const s of r.sets) sets.push({ ...s, dir: c.relDir });
+    for (const s of r.skipped) skipped.push({ ...s, dir: c.relDir });
+    for (const s of r.sets) {
+      for (const f of s.drop) {
+        if (!apply) { deleted.push(f); continue; }
+        try {
+          fs.unlinkSync(f.full);
+          deleted.push(f);
+        } catch (e) {
+          failed.push(`${c.relDir ? `${c.relDir}/` : ''}${f.name}: ${e.message}`);
+        }
       }
     }
   }
-  return { sets, skipped, kept: sets.map(s => s.keep), deleted, failed, scanned: files.length };
+
+  // 清理之后变空的子文件夹（包括本来就空的）一并移除，别在下载目录里留空壳
+  if (apply) {
+    for (const c of containers) {
+      if (!c.relDir) continue;
+      let left;
+      try { left = fs.readdirSync(c.dirPath); } catch { continue; }
+      if (left.length === 0) {
+        try { fs.rmdirSync(c.dirPath); foldersRemoved.push(c.relDir); } catch {}
+      }
+    }
+  }
+
+  return { sets, skipped, kept: sets.map(s => s.keep), deleted, failed, scanned, foldersRemoved };
 }
 
-// 云端（转存目标文件夹当层）里的重复：同一集留一份。
-async function cleanupCloudDuplicates(client, targetDirFid, { apply = false } = {}) {
-  const files = await client.listTopLevelFiles(targetDirFid);
-  const { sets, skipped } = findDuplicateSets(files);
+// 云端清理：目标文件夹当层文件一组；folderPerShow 开启时，每个子文件夹
+// （影视名称文件夹）各自一组。删完后把变空的子文件夹也删掉。
+// folderNames 非空时只处理这些目录（当前配置里的影视名称），不动用户自己建的其它子目录。
+// skipFolders 是本轮刚迁移过文件的文件夹：移动是异步任务，可能还没完成，
+// 这时目录看起来是空的，不能当「空目录」删掉（否则会把正在搬进去的文件弄丢）。
+async function cleanupCloudDuplicates(client, targetDirFid, { apply = false, folders = false, folderNames = null, skipFolders = null } = {}) {
+  const entries = await client.listTopLevelEntries(targetDirFid);
+  const containers = [{ relDir: '', folderFid: targetDirFid, files: entries.filter(e => !e.dir) }];
+  if (folders) {
+    for (const d of entries) {
+      if (!d.dir) continue;
+      if (folderNames && !folderNames.has(d.file_name)) continue;
+      containers.push({ relDir: d.file_name, folderFid: d.fid, files: await client.listAllUserFiles(d.fid) });
+    }
+  }
+
+  const sets = [];
+  const skipped = [];
   const deleted = [];
   const renamed = [];
-
-  if (apply) {
-    for (const s of sets) {
+  const foldersRemoved = [];
+  let scanned = 0;
+  for (const c of containers) {
+    scanned += c.files.length;
+    const r = findDuplicateSets(c.files);
+    for (const s of r.sets) sets.push({ ...s, dir: c.relDir });
+    for (const s of r.skipped) skipped.push({ ...s, dir: c.relDir });
+    if (!apply) {
+      for (const s of r.sets) deleted.push(...s.drop);
+      continue;
+    }
+    for (const s of r.sets) {
       for (let i = 0; i < s.drop.length; i += 30) {
         const batch = s.drop.slice(i, i + 30);
         try {
@@ -2829,12 +3158,10 @@ async function cleanupCloudDuplicates(client, targetDirFid, { apply = false } = 
           logError(`   ✗ 云端删除失败 (${batch[0].file_name} 等 ${batch.length} 个): ${e.message}`);
         }
       }
-    }
-    // 删完之后把带序号的赢家改回不带序号的名字（best-effort）：
-    // 否则清理干净了，留下的大头却叫「凡人修仙传-194 4K (4).mkv」
-    const removed = new Set(deleted);
-    const remain = new Set(files.filter(f => !removed.has(f)).map(f => f.file_name));
-    for (const s of sets) {
+      // 删完之后把带序号的赢家改回不带序号的名字（best-effort）：
+      // 否则清理干净了，留下的大头却叫「凡人修仙传-194 4K (4).mkv」
+      const removed = new Set(s.drop);
+      const remain = new Set(c.files.filter(f => !removed.has(f)).map(f => f.file_name));
       const name = s.keep.file_name;
       const canonical = stripNumericSuffix(name);
       if (canonical === name || remain.has(canonical)) continue;
@@ -2842,37 +3169,190 @@ async function cleanupCloudDuplicates(client, targetDirFid, { apply = false } = 
         await client.renameFile(s.keep.fid, canonical);
         remain.delete(name);
         remain.add(canonical);
-        renamed.push(`${name} → ${canonical}`);
+        renamed.push(`${c.relDir ? `${c.relDir}/` : ''}${name} → ${canonical}`);
       } catch (e) {
         logError(`   ✗ 云端重命名失败 ${name}: ${e.message}`);
       }
     }
-  } else {
-    for (const s of sets) deleted.push(...s.drop);
   }
 
-  return { sets, skipped, kept: sets.map(s => s.keep), deleted, renamed, scanned: files.length };
+  // 清理之后变空的影视名称文件夹一并删除（只删空目录，不动有内容的用户目录）
+  if (apply) {
+    for (const c of containers) {
+      if (!c.relDir) continue;
+      if (skipFolders && skipFolders.has(c.relDir)) continue;
+      const left = await client.listTopLevelEntries(c.folderFid);
+      if (left.length > 0) continue;
+      try {
+        await client.deleteFiles([c.folderFid]);
+        foldersRemoved.push(c.relDir);
+      } catch (e) {
+        logError(`   ✗ 删除空文件夹失败 ${c.relDir}: ${e.message}`);
+      }
+    }
+  }
+
+  return { sets, skipped, kept: sets.map(s => s.keep), deleted, renamed, scanned, foldersRemoved };
 }
 
 // 报告「名字相近但无法确认是同一集」的组：列表本身不动，只提示，避免静默地留着或删错
 function logUnexplainedGroups(skipped, nameOf) {
-  for (const { group } of skipped) {
+  for (const { group, dir } of skipped) {
     const names = group.map(nameOf).join(' / ');
-    logError(`   ⚠ 名字相近但无法确认是同一集的重复，都保留: ${names}`);
+    logError(`   ⚠ ${dir ? `[${dir}] ` : ''}名字相近但无法确认是同一集的重复，都保留: ${names}`);
   }
 }
 
 // 一组重复的清单做成**一条多行记录**：日志视图是按「记录」过滤的，
 // 拆成多条独立记录的话，默认「下载清单」视图里会只剩标题、看不到到底要删哪些文件。
-function dedupeGroupLine(apply, drop, keepName, nameOf) {
-  const lines = drop.map(f => `      ${apply ? '✗' : '·'} ${nameOf(f)}`).join('\n');
-  return `   ${apply ? '🗑 删除' : '将删除'} ${drop.length} 个，保留 ${keepName}\n${lines}`;
+// dir 非空表示这是影视名称文件夹里的文件，显示时带上目录，避免同名文件分不清位置。
+function dedupeGroupLine(apply, drop, keepName, nameOf, dir = '') {
+  const display = f => (dir ? `${dir}/${nameOf(f)}` : nameOf(f));
+  const keep = dir ? `${dir}/${keepName}` : keepName;
+  const lines = drop.map(f => `      ${apply ? '✗' : '·'} ${display(f)}`).join('\n');
+  return `   ${apply ? '🗑 删除' : '将删除'} ${drop.length} 个，保留 ${keep}\n${lines}`;
 }
 
-// 清理重复：cloud 清网盘目标文件夹（当层），local 清本地下载目录
+// 旧文件迁移：folderPerShow 刚开启时，把平铺在当层、带「影视名称-」前缀的文件
+// 搬进「影视名称」文件夹并去掉前缀。先由 dedupe 的「预览」列出清单，确认后再执行。
+export function migrateLocalFlatFiles(saveDir, tips, { apply = false } = {}) {
+  let entries;
+  try { entries = fs.readdirSync(saveDir, { withFileTypes: true }); } catch { return { moves: [], conflicts: [], failed: [] }; }
+  const files = entries
+    .filter(e => e.isFile() && !e.name.startsWith('.') && !e.name.endsWith('.part'))
+    .map(e => ({ name: e.name, full: path.join(saveDir, e.name) }));
+  const plan = planFolderMigration(files, tips);
+  const moves = [];
+  const conflicts = [];
+  const failed = [];
+  for (const p of plan) {
+    const dirPath = path.join(saveDir, p.folder);
+    const targetPath = path.join(dirPath, p.newName);
+    // 目标已存在同名的：不覆盖、不删除，留给下一次清理/人工处理
+    if (fs.existsSync(targetPath)) {
+      conflicts.push({ ...p, reason: `目标已存在: ${p.folder}/${p.newName}` });
+      continue;
+    }
+    const move = { ...p, dirPath, targetPath };
+    if (apply) {
+      // 单个文件移动失败不能中断整个清理流程（否则后面的去重/空目录清理都不跑了）
+      try {
+        fs.mkdirSync(dirPath, { recursive: true });
+        fs.renameSync(p.file.full, targetPath);
+      } catch (e) {
+        failed.push({ ...move, reason: e.message });
+        continue;
+      }
+    }
+    moves.push(move);
+  }
+  // 本地换了目录，.downloaded.json 的记录键也要跟着换，避免下次重下
+  if (apply && moves.length > 0) {
+    try {
+      const record = loadDownloadedRecord(saveDir);
+      let changed = false;
+      for (const m of moves) {
+        const oldKey = getDedupKey({ file_name: m.file.name });
+        for (const [key] of record) {
+          if (key === oldKey || key.startsWith(`${m.file.name}|`)) {
+            record.delete(key);
+            changed = true;
+          }
+        }
+        const newKey = downloadRecordKey(m.newName, m.folder);
+        if (!record.has(newKey)) {
+          record.set(newKey, true);
+          changed = true;
+        }
+      }
+      if (changed) saveDownloadedRecord(saveDir, record);
+    } catch {}
+  }
+  return { moves, conflicts, failed };
+}
+
+// 云端旧文件迁移：把目标文件夹当层带前缀的文件移动到「影视名称」文件夹里。
+// 夸克移动是异步任务，这里只保证请求被接受；失败的会在下次预览里继续出现。
+// 目标文件夹里已有同名文件时不迁移（服务端可能会自动加序号，反倒又攒出重复）。
+export async function migrateCloudFlatFiles(client, targetDirFid, tips, { apply = false } = {}) {
+  const entries = await client.listTopLevelEntries(targetDirFid);
+  const plan = planFolderMigration(entries.filter(e => !e.dir), tips);
+  const moves = [];
+  const conflicts = [];
+  const folderNames = new Map();
+  const namesInFolder = async folder => {
+    if (folderNames.has(folder)) return folderNames.get(folder);
+    let names = new Set();
+    try {
+      const fid = await client.findFolderByName(folder, targetDirFid);
+      if (fid) names = new Set((await client.listAllUserFiles(fid)).map(f => f.file_name));
+    } catch {}
+    folderNames.set(folder, names);
+    return names;
+  };
+  for (const p of plan) {
+    if ((await namesInFolder(p.folder)).has(p.newName)) {
+      conflicts.push({ from: p.file.file_name, folder: p.folder, newName: p.newName, reason: `目标已存在: ${p.folder}/${p.newName}` });
+      continue;
+    }
+    moves.push({
+      from: p.file.file_name,
+      folder: p.folder,
+      newName: p.newName,
+      file: p.file,
+    });
+  }
+  if (!apply) return { moves, conflicts, failed: 0 };
+
+  const byFolder = new Map();
+  for (const m of moves) {
+    if (!byFolder.has(m.folder)) byFolder.set(m.folder, []);
+    byFolder.get(m.folder).push(m);
+  }
+  const done = [];
+  for (const [folder, items] of byFolder) {
+    try {
+      const fid = await client.ensureSubfolder(targetDirFid, folder);
+      for (let i = 0; i < items.length; i += 50) {
+        await client.moveFiles(items.slice(i, i + 50).map(m => m.file.fid), fid);
+      }
+      done.push(...items);
+    } catch (e) {
+      logError(`   ✗ 迁移到「${folder}」失败（文件保持原位，下次预览会再列出）: ${e.message}`);
+    }
+  }
+  return { moves: done, conflicts, failed: moves.length - done.length };
+}
+
+// 配置里所有分享的影视名称（含全局 tip），迁移旧文件时按它们匹配前缀
+function configTips(config) {
+  const tips = new Set();
+  for (const item of normalizeShareUrls(config)) {
+    if (typeof item !== 'string' && item.tip) tips.add(String(item.tip).trim());
+  }
+  if (config.tip) tips.add(String(config.tip).trim());
+  return [...tips].filter(Boolean);
+}
+
+// 当前配置对应的影视名称文件夹名（用于圈定清理范围，避免误动用户自建目录）
+function configShowFolders(config) {
+  return new Set(configTips(config).map(t => showFolderName(t)).filter(Boolean));
+}
+
+
+// 清理重复：cloud 清网盘目标文件夹（当层 / 影视名称文件夹），local 清本地下载目录。
+// folderPerShow 开启时，先把旧的平铺文件迁移到影视名称文件夹（预览只列清单，apply 才动），
+// 清理完再把变空的文件夹删掉。
 async function dedupeInternal(config, { apply = false, cloud = true, local = true } = {}) {
   log(`=== 清理重复副本${apply ? '' : '（预览，不会删除任何文件）'} ===\n`);
+  const folderPerShow = config.folderPerShow === true;
+  const tips = folderPerShow ? configTips(config) : [];
+  // 只认当前配置里的影视名称文件夹，避免把用户自己建的子目录当成清理范围
+  const showFolders = new Set(tips.map(t => showFolderName(t)).filter(Boolean));
   let totalDrop = 0;
+  // 云端迁移失败时，本地也先别迁移：两边布局保持一致（都保持平铺），
+  // 否则云端还在平铺、本地已分文件夹，下载会再下一份平铺副本造成重复
+  let cloudMigrationFailed = false;
 
   if (cloud) {
     if (!config.cookie) {
@@ -2896,13 +3376,41 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
           if (targetDirFid === '0') {
             logError('   ⚠ 未配置目标文件夹，将扫描网盘根目录（建议先在配置页填好目标文件夹）');
           }
-          const r = await cleanupCloudDuplicates(client, targetDirFid, { apply });
+          // 分文件夹：先把旧平铺文件迁移到影视名称文件夹（预览只列清单，apply 才真的移动）
+          let migratedFolders = null;
+          if (folderPerShow && targetDirFid !== '0') {
+            if (tips.length === 0) {
+              logError('   ⚠ 没有配置影视名称（tip），无法把旧文件归类到文件夹');
+            } else {
+              const m = await migrateCloudFlatFiles(client, targetDirFid, tips, { apply });
+              if (m.moves.length > 0) {
+                log(`   整理: ${apply ? '已迁移' : '将迁移'} ${m.moves.length} 个平铺文件到影视名称文件夹`);
+                for (const mv of m.moves) log(`     ${apply ? '✓' : '·'} ${mv.from} → ${mv.folder}/${mv.newName}`);
+                if (!apply) log('       （确认后点「执行删除」或加 --yes 才会真的移动）');
+              }
+              for (const c of m.conflicts) logError(`   ⚠ 未迁移（${c.reason}）: ${c.from}`);
+              if (apply && m.failed > 0) {
+                cloudMigrationFailed = true;
+                logError(`   ⚠ 有 ${m.failed} 个文件迁移失败，保持原位（详见上方错误）`);
+              }
+              // 本轮刚搬过文件的文件夹先别当空目录删：移动是异步任务，可能还没落地
+              if (apply) migratedFolders = new Set(m.moves.map(mv => mv.folder));
+            }
+          }
+          const r = await cleanupCloudDuplicates(client, targetDirFid, {
+            apply,
+            // 网盘根目录里什么都有，分文件夹扫描只对配置好的目标文件夹生效
+            folders: folderPerShow && targetDirFid !== '0',
+            folderNames: showFolders,
+            skipFolders: migratedFolders,
+          });
           log(`   扫描 ${r.scanned} 个文件，发现 ${r.sets.length} 组重复，共 ${r.deleted.length} 个多余副本`);
           for (const s of r.sets) {
-            log(dedupeGroupLine(apply, s.drop, s.keep.file_name, f => f.file_name));
+            log(dedupeGroupLine(apply, s.drop, s.keep.file_name, f => f.file_name, s.dir));
           }
           logUnexplainedGroups(r.skipped, f => f.file_name);
           for (const line of r.renamed) log(`   ✓ 已改回不带序号的名字: ${line}`);
+          for (const name of r.foldersRemoved) log(`   🗑 删除空文件夹: ${name}/`);
           totalDrop += r.deleted.length;
         }
       } catch (e) {
@@ -2923,13 +3431,29 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
       const saveDir = path.resolve(dir);
       log(`\n2. 检查本地目录 ${saveDir}...`);
       try {
-        const r = cleanupLocalDuplicates(saveDir, { apply });
+        // 分文件夹：先把旧的平铺文件迁移到影视名称文件夹（预览只列清单）
+        if (folderPerShow && tips.length > 0) {
+          if (apply && cloudMigrationFailed) {
+            logError('   ⚠ 云端迁移有失败，本次跳过本地迁移（保持两边都平铺，避免下载重复）');
+          } else {
+            const m = migrateLocalFlatFiles(saveDir, tips, { apply });
+            if (m.moves.length > 0) {
+              log(`   整理: ${apply ? '已迁移' : '将迁移'} ${m.moves.length} 个平铺文件到影视名称文件夹`);
+              for (const mv of m.moves) log(`     ${apply ? '✓' : '·'} ${mv.file.name} → ${mv.folder}/${mv.newName}`);
+              if (!apply) log('       （确认后点「执行删除」或加 --yes 才会真的移动）');
+            }
+            for (const c of m.conflicts) logError(`   ⚠ 未迁移（${c.reason}）: ${c.file.name}`);
+            for (const f of m.failed) logError(`   ✗ 迁移失败 ${f.file.name}: ${f.reason}`);
+          }
+        }
+        const r = cleanupLocalDuplicates(saveDir, { apply, folders: folderPerShow, folderNames: showFolders });
         log(`   扫描 ${r.scanned} 个文件，发现 ${r.sets.length} 组重复，共 ${r.deleted.length} 个多余副本`);
         for (const s of r.sets) {
-          log(dedupeGroupLine(apply, s.drop, s.keep.name, f => f.name));
+          log(dedupeGroupLine(apply, s.drop, s.keep.name, f => f.name, s.dir));
         }
         logUnexplainedGroups(r.skipped, f => f.name);
         for (const msg of r.failed) logError(`   ✗ 本地删除失败 ${msg}`);
+        for (const name of r.foldersRemoved) log(`   🗑 删除空文件夹: ${name}/`);
         totalDrop += r.deleted.length;
       } catch (e) {
         logError(`   ✗ 本地清理失败: ${e.message}`);

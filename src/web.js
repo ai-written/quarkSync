@@ -160,6 +160,7 @@ function validateConfig(c) {
   optionalBool('pruneDeadShares');
   optionalBool('downloadAfterSync');
   optionalBool('dedupEpisodesInTarget');
+  optionalBool('folderPerShow');
 
   optionalInt('minFileSizeMB', 0);
   optionalInt('maxFilesPerShare', 0);
@@ -464,6 +465,7 @@ function createServer() {
               name: '清理重复副本（执行删除）',
               running: isTaskRunning('sync'),
               confirm: '将删除网盘目标文件夹与本地下载目录里多余的重复副本（同一集只保留画质最好的那份）。\n'
+                + '若开启了「按影视名称分文件夹」，还会先把旧的平铺文件迁移到对应文件夹，并删除清理后变空的文件夹。\n'
                 + '此操作不可撤销，建议先用上面的「预览」。确定继续吗？',
             },
           ],
