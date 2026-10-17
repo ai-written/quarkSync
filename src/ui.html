@@ -588,6 +588,13 @@ function renderShares(list) {
     };
     // 输入时实时刷新「备用组」标记与文本框高度
     const urlEl = tr.querySelector('[data-f=url]');
+    // 失效链接被清理后 url 为空、但条目还在（影视名称 / 提取码 / 筛选条件都保留）：
+    // 给个专门的提示，免得看着像空行、被人以为该删
+    const hasOther = obj.tip || obj.password || obj.hours !== undefined
+      || obj.minFileSizeMB !== undefined || obj.maxFilesPerShare !== undefined;
+    if (urlText === '' && hasOther) {
+      urlEl.placeholder = '链接已被清空（原分享已失效），粘贴新链接即可；本行的影视名称与筛选条件会保留';
+    }
     urlEl.addEventListener('input', () => {
       const n = urlEl.value.split('\n').filter(s => s.trim()).length;
       if (n > 1 && Number(urlEl.rows) < Math.min(n, 6)) urlEl.rows = Math.min(n, 6);
@@ -678,7 +685,10 @@ function collectShares() {
     const url = asArr ? lines : (lines[0] || '');
 
     const o = {};
-    if (asArr ? lines.length > 0 : url !== '') o.url = url;
+    // 空链接也一定要带上 url 字段：清理失效链接后后端会把 url 清空但保留该条目
+    // （影视名称、提取码、筛选条件…）。以前这里对空链接不写 url，保存时下面的
+    // 过滤会认为「这条没有链接」而整行丢掉，用户填的设置就跟着没了。
+    o.url = url;
     const pw = g('password'); if (pw !== undefined) o.password = pw;
     const tip = g('tip'); if (tip !== undefined) o.tip = tip;
     // hours 支持单位写法，按字符串处理；纯数字存为数字以兼容旧配置
@@ -819,6 +829,8 @@ $('saveBtn').onclick = async () => {
   const ac = inputToCron($('alistCron').value);
   if (ac === '') delete out.alistCron; else out.alistCron = ac;
 
+  // url 为空但带其它字段的条目要保留（清理失效链接后就是这样，方便粘贴新链接）；
+  // 只有「纯空行」——字符串形式的空串——才丢掉，避免用户点了「添加」没填也存进去
   const shares = collectShares().filter(s => {
     if (typeof s === 'string') return s !== '';
     return s.url !== undefined && !(Array.isArray(s.url) && s.url.length === 0);
