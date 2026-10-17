@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
   cleanupLocalDuplicates,
   collectExistingForShare,
+  deriveShowPrefix,
   downloadRecordKey,
   getDedupKey,
   migrateCloudFlatFiles,
@@ -53,6 +54,25 @@ test('planFolderMigration：按前缀规划，前缀重叠时优先更长的', (
     ['遮天2', '08.mkv'],
     ['遮天', '09.mkv'],
   ]);
+});
+
+test('deriveShowPrefix：中文剧名能干净切开；标签/英文/纯数字一律不猜', () => {
+  assert.deepEqual(deriveShowPrefix('大夏守墓人-1.mp4'), { prefix: '大夏守墓人', rest: '1.mp4' });
+  assert.deepEqual(deriveShowPrefix('大王饶命-S03E01.mkv'), { prefix: '大王饶命', rest: 'S03E01.mkv' });
+  assert.equal(deriveShowPrefix('凡人修仙传-194 4K.mkv').prefix, '凡人修仙传');
+  assert.equal(deriveShowPrefix('灵境行者-ZLJZCSDR-08.mp4'), null);  // 前缀含上传标签
+  assert.equal(deriveShowPrefix('10 4K.mp4'), null);                  // 没有剧名前缀
+  assert.equal(deriveShowPrefix('FR.EP195.V2.4K SDR+.AVC-GM.mp4'), null); // 英文前缀不猜
+  assert.equal(deriveShowPrefix('电影名.mkv'), null);                 // 识别不出集数
+});
+
+test('planFolderMigration：derive=true 时能反推没有 tip 的旧文件，切不干净的保持原位', () => {
+  const plan = planFolderMigration([
+    { file_name: '大夏守墓人-1.mp4' },
+    { file_name: '10 4K.mp4' },
+    { file_name: '灵境行者-ZLJZCSDR-08.mp4' },
+  ], [], { derive: true });
+  assert.deepEqual(plan.map(p => [p.folder, p.newName]), [['大夏守墓人', '1.mp4']]);
 });
 
 test('downloadRecordKey：根目录沿用旧键，子目录带目录前缀', () => {
@@ -226,6 +246,18 @@ test('migrateLocalFlatFiles：目标文件已存在时不覆盖，只记冲突',
     assert.equal(r.conflicts.length, 1);
     assert.equal(fs.existsSync(path.join(dir, '灵境行者-08.mkv')), true);
     assert.equal(fs.readFileSync(path.join(dir, '灵境行者', '08.mkv')).length, 100);
+  });
+});
+
+test('migrateLocalFlatFiles：没有 tip 时也能按文件名反推迁移（derive=true），反推不了的原位不动', () => {
+  withTempTree(dir => {
+    writeFile(dir, '大夏守墓人-1.mp4', 100);
+    writeFile(dir, '10 4K.mp4', 50);
+  }, dir => {
+    const applied = migrateLocalFlatFiles(dir, [], { apply: true, derive: true });
+    assert.equal(applied.moves.length, 1);
+    assert.equal(fs.existsSync(path.join(dir, '大夏守墓人', '1.mp4')), true);
+    assert.equal(fs.existsSync(path.join(dir, '10 4K.mp4')), true);
   });
 });
 

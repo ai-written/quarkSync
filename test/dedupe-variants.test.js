@@ -127,6 +127,38 @@ test('looseCopySuffix：只认「画质标记之后 + 去掉后仍有集数」�
   assert.equal(looseCopySuffix('Show.S01E07.mkv'), null);
 });
 
+test('画质/编码标记不同也算重复：4K SDR+ 与 4K、AVC 与 HEVC', () => {
+  const pair = [
+    { file_name: 'FR.EP195.V2.4K SDR+.AVC-GM.mp4', size: 3.2 * 1024 ** 3 },
+    { file_name: 'FR.EP195.V2.4K.AVC-GM.mp4', size: 3.1 * 1024 ** 3 },
+  ];
+  // 先确认归到同一集（SDR+ 不再被当成剧名的一部分）
+  assert.equal(getEpisodeGroup(pair[0].file_name).loose, getEpisodeGroup(pair[1].file_name).loose);
+  const { sets, skipped } = findDuplicateSets(pair);
+  assert.deepEqual(skipped, []);
+  assert.equal(sets.length, 1);
+  assert.equal(sets[0].evidence, '画质/编码标记不同');
+  assert.equal(sets[0].keep.file_name, 'FR.EP195.V2.4K SDR+.AVC-GM.mp4');
+
+  // 只差编码/画质标记的另外两种写法
+  const codec = findDuplicateSets([
+    { file_name: 'Show-08 AVC.mkv', size: 100 },
+    { file_name: 'Show-08 HEVC.mkv', size: 200 },
+  ]);
+  assert.equal(codec.sets.length, 1);
+  assert.equal(codec.sets[0].evidence, '画质/编码标记不同');
+});
+
+test('防误删：只是分隔符不同、标记集合相同的仍按「无法确认」保留', () => {
+  // 两边都有 4K，差别只有分隔符 → 不能升级成「画质/编码标记不同」的证据
+  const { sets, skipped } = findDuplicateSets([
+    { file_name: '凡人修仙传-194 4K.mkv', size: 100 },
+    { file_name: '凡人修仙传 194 4K.mkv', size: 200 },
+  ]);
+  assert.deepEqual(sets, []);
+  assert.equal(skipped.length, 1);
+});
+
 test('防误删：只是分隔符不同、剧名里自带数字的仍按「无法确认」保留', () => {
   // 剧名 Show2 自带数字：两边尾部数字相同（都是 8），不能当成副本序号证据
   const { sets, skipped } = findDuplicateSets([
