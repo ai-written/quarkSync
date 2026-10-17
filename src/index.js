@@ -1741,7 +1741,8 @@ export class QuarkClient {
         plan.files = plan.files.filter(f => {
           const t = resolveFolderTarget(f.file_name, candidates);
           if (!t) return true;
-          if (indexHasSameEpisode(folderIndex(t.folder), t.newName)) {
+          const idx = folderIndex(t.folder);
+          if (folderNameVariants(t.newName, t.folder).some(n => indexHasSameEpisode(idx, n))) {
             crossSkipped++;
             return false;
           }
@@ -1769,11 +1770,15 @@ export class QuarkClient {
       const localIndex = skipExisting ? buildLocalEpisodeIndex(destDir) : null;
       const toDownload = skipExisting
         ? plan.files.filter(f => {
-          const key = downloadRecordKey(f.file_name, plan.relDir);
-          if (!downloadedRecord.has(key)) return true;
-          // 有记录也要确认本地那份是完整的，否则重新下载（自愈被截断的半成品）
-          if (localCopyIsComplete(destDir, f.file_name, f.size, localIndex)) return false;
-          incomplete++;
+          // 影视名称文件夹里的文件可能已带「影视名称-」前缀，也可能还是旧裸名：
+          // 两种写法都查一遍，避免云端/本地命名不一致时重复下载
+          const names = plan.relDir
+            ? folderNameVariants(f.file_name, plan.relDir)
+            : [f.file_name];
+          // 本地已有完整副本就跳过（记录丢了也不重下）
+          if (names.some(n => localCopyIsComplete(destDir, n, f.size, localIndex))) return false;
+          // 有记录但本地副本缺失/大小不符 → 重新下载（自愈被截断的半成品）
+          if (names.some(n => downloadedRecord.has(downloadRecordKey(n, plan.relDir)))) incomplete++;
           return true;
         })
         : plan.files;
@@ -2157,6 +2162,8 @@ export function deriveShowPrefix(fileName) {
 // 把平铺文件规划到对应文件夹（folderPerShow 的旧文件迁移用）：
 // - 按 tips / 已存在的文件夹名前缀匹配，前缀互相包含时优先更长的
 // - 都没匹配上且 derive=true 时，用 deriveShowPrefix 从文件名反推（只对中文剧名、且切得干净）
+// 文件放进文件夹后**仍保留「影视名称-」前缀**（与转存后的命名一致）；
+// 反推出来的名字统一重排成「前缀-剩下部分」，保证 - 拼接。
 // 返回 [{ file, folder, newName }]、保持输入顺序。导出仅为测试用。
 export function planFolderMigration(files, tips, { derive = false } = {}) {
   const candidates = [...new Set((tips || []).map(t => showFolderName(t)).filter(Boolean))]
@@ -2167,8 +2174,8 @@ export function planFolderMigration(files, tips, { derive = false } = {}) {
     const name = f.file_name || f.name || '';
     const hit = candidates.find(c => name.startsWith(c.prefix));
     if (hit) {
-      const newName = name.slice(hit.prefix.length);
-      if (newName) out.push({ file: f, folder: hit.folder, newName });
+      // 已经带前缀：只换文件夹，文件名不动
+      if (name.length > hit.prefix.length) out.push({ file: f, folder: hit.folder, newName: name });
       continue;
     }
     if (!derive) continue;
@@ -2176,7 +2183,7 @@ export function planFolderMigration(files, tips, { derive = false } = {}) {
     if (!d) continue;
     const folder = showFolderName(d.prefix);
     if (!folder || !d.rest) continue;
-    out.push({ file: f, folder, newName: d.rest });
+    out.push({ file: f, folder, newName: `${d.prefix}-${d.rest}` });
   }
   return out;
 }
@@ -2308,12 +2315,14 @@ export async function applyNamePrefix(client, targetDirFid, names, shareTip, opt
 // 统一的「文件 + 更新时间」行：正式运行逐条打印，试运行先收集、最后一次性打印。
 // opts.prefix 是该分享的影视名称：列出的就是加前缀之后的最终文件名，与正式运行结束时
 // 「成功转存的文件」一致。分享里本就带前缀的文件不会被叠加（同 applyNamePrefix 的判断）。
-export function buildFileLines(files, { prefix = '' } = {}) {
+// opts.folder 是影视名称文件夹（folderPerShow）：清单里带上目录，和实际落盘位置一致。
+export function buildFileLines(files, { prefix = '', folder = '' } = {}) {
   const p = normalizePrefix(prefix);
+  const dir = folder ? `${folder}/` : '';
   return files.map(f => {
     const date = new Date(String(f.updated_at).length <= 10 ? f.updated_at * 1000 : f.updated_at);
     const name = p && !String(f.file_name).startsWith(p) ? `${p}${f.file_name}` : f.file_name;
-    return `  - ${name}  (更新于: ${date.toLocaleString('zh-CN')})`;
+    return `  - ${dir}${name}  (更新于: ${date.toLocaleString('zh-CN')})`;
   });
 }
 
@@ -2397,6 +2406,15 @@ async function syncInternal(config, opts = {}) {
       }
       for (const c of m.conflicts) logError(`   ⚠ 未迁移（${c.reason}）: ${c.from}`);
       if (m.failed > 0) logError(`   ⚠ 有 ${m.failed} 个文件迁移失败，保持原位（详见上方错误）`);
+      // 文件夹里早期版本迁进去的裸名文件补齐「影视名称-」前缀
+      const n = await normalizeCloudFolderNames(client, targetDirFid, [...configShowFolders(config)], { apply: true });
+      if (n.renames.length > 0) {
+        log(`   整理: 已给 ${n.renames.length} 个文件补上影视名称前缀`);
+        for (const r of n.renames.slice(0, 20)) log(`     ✓ ${r.folder}/${r.from} → ${r.folder}/${r.newName}`);
+        if (n.renames.length > 20) log(`     …共 ${n.renames.length} 个`);
+      }
+      for (const c of n.conflicts) logError(`   ⚠ 未补前缀（${c.reason}）: ${c.folder}/${c.from}`);
+      for (const f of n.failed) logError(`   ✗ 补前缀失败 ${f.folder}/${f.from}: ${f.reason}`);
     } catch (e) {
       logError(`   ✗ 整理旧文件失败（不影响本次同步）: ${e.message}`);
     }
@@ -2570,19 +2588,19 @@ async function syncInternal(config, opts = {}) {
       }
 
       // 试运行：不在这里打印（进度已静音），改为收集起来，函数末尾一次性输出
-      // 分文件夹时文件名不加上前缀（文件夹就是剧名）；平铺时仍按加前缀后的最终名列出
-      const namePrefix = shareFolder ? '' : shareTip;
+      // 清单里给的是加完偏移后的最终文件名（文件夹模式下文件在「影视名称/」里，名字同样带前缀）
+      const namePrefix = shareTip;
       if (dryRun) {
         dryRunWouldTransfer += newFiles.length;
         dryRunEntries.push({
           label: shareTip || pwdIds[0] || `第 ${si + 1} 个分享`,
-          lines: buildFileLines(newFiles, { prefix: namePrefix }),
+          lines: buildFileLines(newFiles, { prefix: namePrefix, folder: shareFolder }),
         });
         continue;
       }
 
       log('待转存文件列表:');
-      for (const line of buildFileLines(newFiles, { prefix: namePrefix })) log(line);
+      for (const line of buildFileLines(newFiles, { prefix: namePrefix, folder: shareFolder })) log(line);
       log('');
 
       const transferDirFid = shareDirFid || targetDirFid;
@@ -2603,10 +2621,8 @@ async function syncInternal(config, opts = {}) {
         for (const name of results.success) log(`  ✓ ${name}`);
       }
 
-      // 分文件夹时文件名保持原名，不再加「影视名称-」前缀；平铺时维持原有行为
-      const renamedNames = shareFolder
-        ? results.success
-        : await applyNamePrefix(client, transferDirFid, results.success, shareTip);
+      // 无论平铺还是分文件夹，文件名都加上「影视名称-」前缀（文件夹模式下前缀在文件夹内部）
+      const renamedNames = await applyNamePrefix(client, transferDirFid, results.success, shareTip);
 
       totalSuccess += results.success.length;
       totalFailed += results.failed.length;
@@ -2752,7 +2768,8 @@ export async function runSyncThenDownload(config) {
 }
 
 // 下载前整理本地旧文件：开启分文件夹后，把 downloadDir 当层带「影视名称-」前缀的
-// 文件搬进对应文件夹（用户不必先手动跑一次「清理重复副本 → 执行删除」）
+// 文件搬进对应文件夹，并给文件夹里的裸名文件补齐前缀
+// （用户不必先手动跑一次「清理重复副本 → 执行删除」）
 function migrateLocalBeforeDownload(config, saveDir) {
   if (config.folderPerShow !== true) return;
   try {
@@ -2763,6 +2780,14 @@ function migrateLocalBeforeDownload(config, saveDir) {
     }
     for (const c of m.conflicts) logError(`   ⚠ 未迁移（${c.reason}）: ${c.file.name}`);
     for (const f of m.failed) logError(`   ✗ 迁移失败 ${f.file.name}: ${f.reason}`);
+    const n = normalizeLocalFolderNames(saveDir, [...configShowFolders(config)], { apply: true });
+    if (n.renames.length > 0) {
+      log(`   整理: 已给 ${n.renames.length} 个文件补上影视名称前缀`);
+      for (const r of n.renames.slice(0, 20)) log(`     ✓ ${r.folder}/${r.from} → ${r.folder}/${r.newName}`);
+      if (n.renames.length > 20) log(`     …共 ${n.renames.length} 个`);
+    }
+    for (const c of n.conflicts) logError(`   ⚠ 未补前缀（${c.reason}）: ${c.folder}/${c.from}`);
+    for (const f of n.failed) logError(`   ✗ 补前缀失败 ${f.folder}/${f.from}: ${f.reason}`);
   } catch (e) {
     logError(`   ✗ 整理本地旧文件失败（不影响下载）: ${e.message}`);
   }
@@ -2950,7 +2975,8 @@ class AlistClient {
         plan.files = plan.files.filter(f => {
           const t = resolveFolderTarget(f.name, candidates);
           if (!t) return true;
-          if (indexHasSameEpisode(folderIndex(t.folder), t.newName)) {
+          const idx = folderIndex(t.folder);
+          if (folderNameVariants(t.newName, t.folder).some(n => indexHasSameEpisode(idx, n))) {
             crossSkipped++;
             return false;
           }
@@ -2975,10 +3001,12 @@ class AlistClient {
       const localIndex = skipExisting ? buildLocalEpisodeIndex(destDir) : null;
       const toDownload = skipExisting
         ? plan.files.filter(f => {
-          const key = downloadRecordKey(f.name, plan.relDir);
-          if (!downloadedRecord.has(key)) return true;
-          if (localCopyIsComplete(destDir, f.name, f.size, localIndex)) return false;
-          incomplete++;
+          // 与夸克侧一致：文件夹里的文件可能带前缀也可能是旧裸名，两种都查
+          const names = plan.relDir
+            ? folderNameVariants(f.name, plan.relDir)
+            : [f.name];
+          if (names.some(n => localCopyIsComplete(destDir, n, f.size, localIndex))) return false;
+          if (names.some(n => downloadedRecord.has(downloadRecordKey(n, plan.relDir)))) incomplete++;
           return true;
         })
         : plan.files;
@@ -3395,6 +3423,18 @@ function resolveFolderTarget(fileName, candidates) {
   return hit || null;
 }
 
+// 文件夹里同一个文件可能出现的三种写法：带前缀 / 裸名（早期版本迁进去的）。
+// 下载跳过判定用它，避免云端还没改名（裸名）而本地已补前缀时重复下载。
+export function folderNameVariants(fileName, folder) {
+  const prefix = normalizePrefix(folder);
+  const name = String(fileName || '');
+  return [...new Set([
+    name,
+    name.startsWith(prefix) ? name : `${prefix}${name}`,
+    stripShowPrefix(name, folder),
+  ])];
+}
+
 // 旧文件迁移：folderPerShow 刚开启时，把平铺在当层、带「影视名称-」前缀的文件
 // 搬进「影视名称」文件夹并去掉前缀。先由 dedupe 的「预览」列出清单，确认后再执行。
 export function migrateLocalFlatFiles(saveDir, tips, { apply = false, derive = false } = {}) {
@@ -3411,9 +3451,13 @@ export function migrateLocalFlatFiles(saveDir, tips, { apply = false, derive = f
   for (const p of plan) {
     const dirPath = path.join(saveDir, p.folder);
     const targetPath = path.join(dirPath, p.newName);
-    // 目标已存在同名的：不覆盖、不删除，留给下一次清理/人工处理
-    if (fs.existsSync(targetPath)) {
-      conflicts.push({ ...p, reason: `目标已存在: ${p.folder}/${p.newName}` });
+    // 目标已存在同名（含文件夹里早期版本的裸名写法）：不覆盖、不重复搬，
+    // 交给补前缀/清理去处理
+    const existing = folderNameVariants(p.newName, p.folder)
+      .map(v => ({ v, abs: path.join(dirPath, v) }))
+      .find(x => fs.existsSync(x.abs));
+    if (existing) {
+      conflicts.push({ ...p, reason: `目标已存在: ${p.folder}/${existing.v}` });
       continue;
     }
     const move = { ...p, dirPath, targetPath };
@@ -3475,8 +3519,11 @@ export async function migrateCloudFlatFiles(client, targetDirFid, tips, { apply 
     return names;
   };
   for (const p of plan) {
-    if ((await namesInFolder(p.folder)).has(p.newName)) {
-      conflicts.push({ from: p.file.file_name, folder: p.folder, newName: p.newName, reason: `目标已存在: ${p.folder}/${p.newName}` });
+    // 目标已存在同名（含文件夹里早期版本的裸名写法）时不搬，避免同一集在文件夹里出现两份
+    const names = await namesInFolder(p.folder);
+    const hit = folderNameVariants(p.newName, p.folder).find(v => names.has(v));
+    if (hit) {
+      conflicts.push({ from: p.file.file_name, folder: p.folder, newName: p.newName, reason: `目标已存在: ${p.folder}/${hit}` });
       continue;
     }
     moves.push({
@@ -3506,6 +3553,102 @@ export async function migrateCloudFlatFiles(client, targetDirFid, tips, { apply 
     }
   }
   return { moves: done, conflicts, failed: moves.length - done.length };
+}
+
+// 把影视名称文件夹里「没有前缀」的旧文件补上「影视名称-」前缀。
+// v1.12.0/1.12.1 迁进文件夹的文件是裸名；现在统一成「文件夹/影视名称-原名」。
+// 只处理传入的 folders（调用方给当前配置的影视名称），用户自建目录不碰。
+export function normalizeLocalFolderNames(saveDir, folders, { apply = false } = {}) {
+  const renames = [];
+  const conflicts = [];
+  const failed = [];
+  for (const folder of folders || []) {
+    if (!folder) continue;
+    const dirPath = path.join(saveDir, folder);
+    let entries;
+    try { entries = fs.readdirSync(dirPath, { withFileTypes: true }); } catch { continue; }
+    const prefix = normalizePrefix(folder);
+    const exists = new Set(entries.filter(e => e.isFile()).map(e => e.name));
+    for (const e of entries) {
+      if (!e.isFile() || e.name.startsWith('.') || e.name.endsWith('.part')) continue;
+      if (e.name.startsWith(prefix)) continue;
+      const newName = `${prefix}${e.name}`;
+      if (exists.has(newName)) {
+        conflicts.push({ folder, from: e.name, reason: `目标已存在: ${folder}/${newName}` });
+        continue;
+      }
+      const item = {
+        folder, from: e.name, newName,
+        fromPath: path.join(dirPath, e.name),
+        toPath: path.join(dirPath, newName),
+      };
+      if (apply) {
+        try {
+          fs.renameSync(item.fromPath, item.toPath);
+        } catch (err) {
+          failed.push({ ...item, reason: err.message });
+          continue;
+        }
+      }
+      exists.add(newName);
+      renames.push(item);
+    }
+  }
+  // 文件名变了，.downloaded.json 的记录键也要跟着改，避免重下
+  if (apply && renames.length > 0) {
+    try {
+      const record = loadDownloadedRecord(saveDir);
+      let changed = false;
+      for (const r of renames) {
+        const oldKey = downloadRecordKey(r.from, r.folder);
+        if (record.delete(oldKey)) changed = true;
+        const newKey = downloadRecordKey(r.newName, r.folder);
+        if (!record.has(newKey)) {
+          record.set(newKey, true);
+          changed = true;
+        }
+      }
+      if (changed) saveDownloadedRecord(saveDir, record);
+    } catch {}
+  }
+  return { renames, conflicts, failed };
+}
+
+// 云端版本：把影视名称文件夹里没前缀的文件重命名成「影视名称-原名」。
+async function normalizeCloudFolderNames(client, targetDirFid, folders, { apply = false } = {}) {
+  const renames = [];
+  const conflicts = [];
+  const failed = [];
+  for (const folder of folders || []) {
+    if (!folder) continue;
+    let fid;
+    try { fid = await client.findFolderByName(folder, targetDirFid); } catch { continue; }
+    if (!fid) continue;
+    let files;
+    try { files = await client.listAllUserFiles(fid); } catch { continue; }
+    const prefix = normalizePrefix(folder);
+    const exists = new Set(files.map(f => f.file_name));
+    for (const f of files) {
+      const name = String(f.file_name || '');
+      if (!name || name.startsWith(prefix)) continue;
+      const newName = `${prefix}${name}`;
+      if (exists.has(newName)) {
+        conflicts.push({ folder, from: name, reason: `目标已存在: ${folder}/${newName}` });
+        continue;
+      }
+      if (apply) {
+        try {
+          await client.renameFile(f.fid, newName);
+        } catch (e) {
+          failed.push({ folder, from: name, reason: e.message });
+          continue;
+        }
+      }
+      exists.add(newName);
+      renames.push({ folder, from: name, newName });
+    }
+  }
+  return { renames, conflicts, failed };
 }
 
 // 配置里所有分享的影视名称（含全局 tip），迁移旧文件时按它们匹配前缀
@@ -3557,7 +3700,8 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
           if (targetDirFid === '0') {
             logError('   ⚠ 未配置目标文件夹，将扫描网盘根目录（建议先在配置页填好目标文件夹）');
           }
-          // 分文件夹：先把旧平铺文件迁移到影视名称文件夹（预览只列清单，apply 才真的移动）
+          // 分文件夹：先把旧平铺文件迁移到影视名称文件夹（预览只列清单，apply 才真的移动），
+          // 再给文件夹里早期版本的裸名文件补上「影视名称-」前缀
           let migratedFolders = null;
           if (folderPerShow && targetDirFid !== '0') {
             const m = await migrateCloudFlatFiles(client, targetDirFid, tips, { apply, derive: true });
@@ -3570,6 +3714,16 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
             if (apply && m.failed > 0) logError(`   ⚠ 有 ${m.failed} 个文件迁移失败，保持原位（详见上方错误）`);
             // 本轮刚搬过文件的文件夹先别当空目录删：移动是异步任务，可能还没落地
             if (apply) migratedFolders = new Set(m.moves.map(mv => mv.folder));
+
+            const n = await normalizeCloudFolderNames(client, targetDirFid, [...showFolders], { apply });
+            if (n.renames.length > 0) {
+              log(`   整理: ${apply ? '已给' : '将给'} ${n.renames.length} 个文件补上影视名称前缀`);
+              for (const r of n.renames.slice(0, 30)) log(`     ${apply ? '✓' : '·'} ${r.folder}/${r.from} → ${r.folder}/${r.newName}`);
+              if (n.renames.length > 30) log(`     …共 ${n.renames.length} 个`);
+              if (!apply) log('       （确认后点「执行删除」或加 --yes 才会真的重命名）');
+            }
+            for (const c of n.conflicts) logError(`   ⚠ 未补前缀（${c.reason}）: ${c.folder}/${c.from}`);
+            for (const f of n.failed) logError(`   ✗ 补前缀失败 ${f.folder}/${f.from}: ${f.reason}`);
           }
           const r = await cleanupCloudDuplicates(client, targetDirFid, {
             apply,
@@ -3605,7 +3759,8 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
       const saveDir = path.resolve(dir);
       log(`\n2. 检查本地目录 ${saveDir}...`);
       try {
-        // 分文件夹：先把旧的平铺文件迁移到影视名称文件夹（预览只列清单）
+        // 分文件夹：先把旧的平铺文件迁移到影视名称文件夹（预览只列清单），
+        // 再给文件夹里早期版本的裸名文件补上「影视名称-」前缀
         if (folderPerShow) {
           const m = migrateLocalFlatFiles(saveDir, tips, { apply, derive: true });
           if (m.moves.length > 0) {
@@ -3615,6 +3770,16 @@ async function dedupeInternal(config, { apply = false, cloud = true, local = tru
           }
           for (const c of m.conflicts) logError(`   ⚠ 未迁移（${c.reason}）: ${c.file.name}`);
           for (const f of m.failed) logError(`   ✗ 迁移失败 ${f.file.name}: ${f.reason}`);
+
+          const n = normalizeLocalFolderNames(saveDir, [...showFolders], { apply });
+          if (n.renames.length > 0) {
+            log(`   整理: ${apply ? '已给' : '将给'} ${n.renames.length} 个文件补上影视名称前缀`);
+            for (const r of n.renames.slice(0, 30)) log(`     ${apply ? '✓' : '·'} ${r.folder}/${r.from} → ${r.folder}/${r.newName}`);
+            if (n.renames.length > 30) log(`     …共 ${n.renames.length} 个`);
+            if (!apply) log('       （确认后点「执行删除」或加 --yes 才会真的重命名）');
+          }
+          for (const c of n.conflicts) logError(`   ⚠ 未补前缀（${c.reason}）: ${c.folder}/${c.from}`);
+          for (const f of n.failed) logError(`   ✗ 补前缀失败 ${f.folder}/${f.from}: ${f.reason}`);
         }
         const r = cleanupLocalDuplicates(saveDir, { apply, folders: folderPerShow, folderNames: showFolders });
         log(`   扫描 ${r.scanned} 个文件，发现 ${r.sets.length} 组重复，共 ${r.deleted.length} 个多余副本`);
