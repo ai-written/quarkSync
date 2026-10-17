@@ -658,21 +658,31 @@ function parseShareUrl(url) {
 // 判断分享是否真的失效（区别于网络抖动/限流等临时故障）。
 // 只认明确表示「分享不存在/已失效」的文案；拿不准一律按临时故障处理，
 // 避免把可用的链接误删。
-function isShareDead(msg) {
+export function isShareDead(msg) {
   const s = String(msg || '');
   const dead = [
     /分享.{0,6}(已)?(失效|过期|不存在|被删除|取消)/,
     /(失效|过期)的?(分享|链接)/,
     /链接.{0,6}(已)?(失效|过期|不存在|被删除|违规)/,
-    /(分享|链接).{0,4}(违规|屏蔽|和谐)/,
+    /(分享|链接).{0,4}(违规|屏蔽|和谐|封禁)/,
+    // 分享者账号被封禁：链接条目还在，但实际上没人能看了。
+    // 夸克实际返回 `403 / code 41031「分享者用户封禁链接查看受限」`，旧规则只认
+    // 「失效/违规」这类字面，于是漏判成临时故障 —— 表现就是每轮同步都报这一条错，
+    // 却永远不清配置。对转存来说它与失效等价，按已失效处理。
+    /分享者.{0,12}(被?封禁|被封|封号)/,
+    /"code"\s*:\s*41031\b/,
     /share\s*(not\s*(found|exist)|expired|invalid|deleted)/i,
     /(pwd_id|pwdid).{0,10}(invalid|not\s*found)/i,
   ];
   if (dead.some(re => re.test(s))) return true;
   // 提取码相关：链接本身没坏，不算失效
   if (/提取码|passcode|密码/.test(s)) return false;
-  // 明确的临时性故障：网络、超时、限流、服务端错误
-  if (/timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket hang up|network|限流|频率|23018|5\d\d/i.test(s)) return false;
+  // 明确的临时性故障：网络、超时、限流、服务端错误。
+  // 5xx 只认明确的 HTTP 状态位（[503]、status code 503、"status":503）：
+  // 不能直接匹配 `5\d\d`，否则响应 JSON 里的时间戳（如 ...1792152012 里的 520）
+  // 或 req_id 会被误当成 5xx。
+  if (/timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket hang up|network|限流|频率|23018/i.test(s)) return false;
+  if (/\[5\d\d\]|status(?:\s*code)?\s*[:=]?\s*5\d\d/i.test(s)) return false;
   return false;
 }
 
@@ -680,7 +690,7 @@ function isShareDead(msg) {
 // - 备用链接组：只删失效的那条，保留可用项
 // - 单链接或全部失效：把 url 清空（保留条目本身，便于手动修复）
 // - 清理后无任何有效链接的条目会被标记，调用方可决定是否跳过
-function pruneDeadUrls(shareUrls, deadPwdIds) {
+export function pruneDeadUrls(shareUrls, deadPwdIds) {
   const removed = [];
   const result = [];
   for (const item of shareUrls) {
@@ -757,6 +767,57 @@ export function stripNumericSuffix(fileName) {
 // 于是同一集的 4K 与 1080p 被判成两集 —— 既不去重、也判不出「已存在」，重复就是这么来的。
 const EPISODE_NOISE = /(\d{3,4}\s*[xX]\s*\d{3,4}|1080p|720p|2160p|480p|4k|8k|uhd|fhd|hdr10\+?|hdr|hevc|x265|x264|h264|avc|10bit|8bit|web-?dl|bluray|remux|aac|dts|60fps)/gi;
 
+// 上游重传/搬运常往文件名里塞一段随机大写串（如「灵境行者-ZLJZCSDR-08.mp4」）。
+// 它既不是剧名也不是季集写法，却会让同一集的两个版本被分到两个键里 ——
+// 转存时拦不住、清理时也认不出，重复就是这么攒下来的。
+// 剥掉它的规则刻意定得很严，避免误伤正常剧名：
+// - 必须被分隔符或首尾包住（`SD高达` 里的 SD 不算）
+// - 至少 5 个字符、全大写字母/数字（`SD`、`HDR`、`S01E07` 都不够长/不含 5 个字母）
+// - 不含元音（含 Y）：`SEAL`、`TBBT`、`RHYTHM` 这类正常英文词不会被剥
+const UPLOAD_TAG = /(^|[-_.\s[\]()（）])([A-Z0-9]{5,})(?=$|[-_.\s[\]()（）])/g;
+
+// 导出仅为测试用
+export function stripUploadTags(name) {
+  const s = String(name ?? '');
+  let hit = false;
+  const out = s.replace(UPLOAD_TAG, (m, pre, token) => {
+    const letters = token.replace(/[^A-Z]/g, '');
+    if (letters.length < 5 || /[AEIOUY]/.test(letters)) return m;
+    hit = true;
+    return pre;
+  });
+  if (!hit) return s;
+  // 标签两边可能各有一个分隔符（`剧名-标签-08`），去掉后收成一个，别留下 `--08`
+  return out.replace(/([-_.\s])\1+/g, '$1');
+}
+
+// 名字里是否带着上游上传标签（用于「为什么算重复」的证据）
+function hasUploadTag(fileName) {
+  const base = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
+  return stripUploadTags(base) !== base;
+}
+
+// 尾部还挂着「副本序号」的名字，如 `吞噬星空-245_4K_1` 里的 `_1`。
+// 只认**紧跟在画质/编码标记之后**的 1~2 位尾部数字：
+// - 去掉它之后，前面还得有一个独立成词的集数（`…-245_4K` 里的 245）
+// - 剧名结尾自带数字时（`庆余年 2-02`、`Region 2-02`、`斗罗大陆2-08`）前面没有画质标记，
+//   后面的数字更可能是集数本身 —— 不当副本序号证据，否则会把不同集/不同文件判成可删
+// `凡人修仙传-194`、`大夏守墓人-1` 去掉后不再有独立成词的数字，也不算。
+// 导出仅为测试用
+export function looseCopySuffix(name) {
+  const base = stripNumericSuffix(name).replace(/\.[^.]+$/, '');
+  const m = base.match(/[-_.\s]+(\d{1,3})\s*$/);
+  if (!m) return null;
+  if (+m[1] > 99) return null;
+  const headRaw = base.slice(0, m.index);
+  const head = headRaw.replace(EPISODE_NOISE, ' ');
+  // 序号前必须有画质/编码标记（…_4K_1）；没有画质标记的 `Show-08_1` 保守地不当副本序号
+  if (head === headRaw) return null;
+  // 去掉序号后，前面仍有一个带分隔符的数字（真正的集数），例如 吞噬星空-245_4K → -245
+  if (!/[-_.\s]+\d+[-_.\s]*$/.test(head)) return null;
+  return m[0];
+}
+
 // parseEpisode 的内部版本：额外给出「季号是不是明确写出来的」。
 // 灵境行者-S01E07.mkv（季 1）与 灵境行者-07.mkv（没写季）是同一集，可以合并；
 // 但 第1季第7集 与 第2季第7集 不是同一集 —— 只有知道季号是否明确，才能安全地合并。
@@ -764,7 +825,9 @@ const EPISODE_NOISE = /(\d{3,4}\s*[xX]\s*\d{3,4}|1080p|720p|2160p|480p|4k|8k|uhd
 // 必须沿用历史算法，改了会让升级前的记录全部失配、触发全量重下（见 getEpisodeKey 的注释）。
 function parseEpisodeInfo(fileName, { keepNoise = false } = {}) {
   const base = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
-  const name = keepNoise ? base : base.replace(EPISODE_NOISE, ' ');
+  // 除了记录键，其余场景先剥掉上传标签：否则标签里的数字会被下面的
+  // 「取最长数字当集数」挑中，把第 8 集算成第 12345 集
+  const name = keepNoise ? base : stripUploadTags(base).replace(EPISODE_NOISE, ' ');
   let m;
 
   m = name.match(/[Ss](\d+)\s*[Ee](?:\s*P\s*)?(\d+)/);
@@ -850,8 +913,11 @@ export function getEpisodeKey(fileName) {
 //   剥掉会把两部不同的剧并成同一集 —— 清理重复副本就会误删其中一份（真实文件名验证过）
 // - 结尾集数必须**带分隔符**才剥：`斗罗大陆2` 与 `斗罗大陆-02` 是两部剧，不能都归成「斗罗大陆」
 // - 分隔符归一成空格而不是删掉：`Show-A` 与 `Showa` 要保持不同
-function episodeShowLoose(fileName) {
+// - 上游上传标签要剥：`灵境行者-ZLJZCSDR-08` 与 `灵境行者-08` 是同一集被重新上传过
+// episode 传解析出来的集数：从右往左剥尾部数字时，剥到它为止 —— 见下面的注释
+function episodeShowLoose(fileName, episode) {
   let s = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
+  s = stripUploadTags(s);
   s = s.replace(
     /(^|[-_.\s[\]()（）])(hdr10\+?|hdr|dolby\s*vision|dolbyvision|8k|4k|2160p|1080p|720p|480p|uhd|fhd|hd|sd|hevc|x265|x264|h264|avc|10bit|8bit|web-?dl|bluray|remux|aac|dts|60fps)(?=$|[-_.\s[\]()（）])/gi,
     '$1',
@@ -860,7 +926,27 @@ function episodeShowLoose(fileName) {
   s = s.replace(/[-_.\s]*第?\s*\d+\s*季.*$/, '');
   s = s.replace(/[-_.\s]*第?\s*\d+\s*集.*$/, '');
   s = s.replace(/[-_.\s]*\d{1,2}\s*[xX]\s*\d{1,3}.*$/, '');              // 1x07
-  s = s.replace(/[-_.\s]+\d+\s*$/, '');                                  // 结尾集数（必须带分隔符）
+  // 从右往左剥尾部数字，**剥到解析出来的集数为止**：
+  // - 画质标记被剥掉后可能露出新的尾部数字：吞噬星空-245_4K_1 → 吞噬星空-245_ _1，
+  //   先把 `_1` 剥掉，再剥集数 245 → 吞噬星空（只剥一次会留下「吞噬星空 245」）
+  // - 但不能一路剥光：`斗罗大陆 2-245` 的 2 是剧名/季号，剥掉会跟「斗罗大陆-245」并成同一集，
+  //   转存时就会把另一部剧当成「已有」而漏转。所以碰到集数就停；非集数的 4 位以上数字
+  //   （年份、编号）也不动。
+  // 尾部若只剩分隔符也一并吃掉（`Show-08-4K` 剥掉画质后是 `Show-08- `）。
+  if (episode !== undefined && episode !== null) {
+    const ep = Number(episode);
+    for (;;) {
+      const m = s.match(/[-_.\s]+(\d+)[-_.\s]*$/);
+      if (!m) break;
+      const n = Number(m[1]);
+      if (n === ep) {
+        s = s.slice(0, m.index);
+        break;
+      }
+      if (m[1].length > 3) break;   // 年份/编号不是副本序号，留着
+      s = s.slice(0, m.index);
+    }
+  }
   return s.replace(/[.\-_\s]+/g, ' ').trim().toLowerCase();
 }
 
@@ -871,19 +957,50 @@ export function getEpisodeGroup(fileName) {
   const info = parseEpisodeInfo(fileName);
   if (!info) return null;
   return {
-    loose: `ep_${episodeShowLoose(fileName)}_E${info.episode}`,
+    loose: `ep_${episodeShowLoose(fileName, info.episode)}_E${info.episode}`,
     season: info.seasonKnown ? info.season : null,
     // 季集写法（se / seasonCn / seasonSep / x / epCn / bare）：清理时的「为什么算重复」要用它
     notation: info.notation,
   };
 }
 
-const QUALITY_SCORE = { '4k': 5, '2160p': 4, 'uhd': 4, '1080p': 3, 'fhd': 3, '1080': 3, '720p': 2, 'hd': 2, '720': 2, '高清': 2, '标清': 1, 'sd': 1 };
+// 画质标记必须独立成词才能算数：旧实现用 `includes`，于是随机上传标签里的 "sd"
+// （如 灵境行者-ZLJZCSDR-08.mp4）会被当成标清 —— 清理时据此「留画质高的那份」，
+// 反而会把体积更大、画质更好的一份删掉。中文画质词不受此限（「高清版」也要算高清）。
+// hdr / hdtv / hdr10 / 1080i 单独列出来：旧实现是靠 `hd`、`1080` 子串顺带命中的，
+// 改成独立成词后不补上就会从「能识别的画质」里消失，HDR 版与普通版不再被判成重复。
+const QUALITY_SCORE = {
+  '4k': 5,
+  '2160p': 4,
+  'uhd': 4,
+  '1080p': 3,
+  'fhd': 3,
+  '1080i': 3,
+  '1080': 3,
+  '720p': 2,
+  'hd': 2,
+  'hdr': 2,
+  'hdtv': 2,
+  'hdr10': 2,
+  '720': 2,
+  '高清': 2,
+  '标清': 1,
+  'sd': 1,
+};
+
+// 预编译成「独立成词」的匹配规则；中文画质词按子串认（「高清版」也要算高清）。
+const QUALITY_RULES = Object.entries(QUALITY_SCORE).map(([kw, score]) => ({
+  kw,
+  score,
+  re: /[\u3400-\u9fff]/.test(kw)
+    ? null
+    : new RegExp(`(^|[-_.\\s\\[\\]()（）])${kw}(?=$|[-_.\\s\\[\\]()（）])`),
+}));
 
 export function getQualityScore(fileName) {
-  const lower = fileName.toLowerCase();
-  for (const [kw, score] of Object.entries(QUALITY_SCORE)) {
-    if (lower.includes(kw)) return score;
+  const lower = String(fileName ?? '').toLowerCase();
+  for (const { kw, score, re } of QUALITY_RULES) {
+    if (re ? re.test(lower) : lower.includes(kw)) return score;
   }
   return 0;
 }
@@ -979,17 +1096,31 @@ export function indexHasSameEpisode(index, fileName) {
 }
 
 // 「凭什么说这几份是同一集的重复」—— 必须有可解释的证据才动手：
-// - 有序号副本：名字里带自动加的 `(2)(3)`（`stripNumericSuffix` 能剥掉）
+// - 有序号副本：名字里带自动加的 `(2)(3)`，或尾部还挂着 `_1` 这种副本序号
 // - 画质不同：4K / 1080p 这类（保留画质高的那份）
 // - 季集写法不同：`S01E07` 与 `07`、`第1季-07` 与 `第07集` 这类
-// 三条都对不上时（只是名字凑巧被归一化成同一个键），一律**不动** ——
+// - 剧名带上传标签：`灵境行者-ZLJZCSDR-08` 与 `灵境行者-08`（标签不携带内容信息）
+// 都对不上时（只是名字凑巧被归一化成同一个键），一律**不动** ——
 // 删除不可逆，而分组靠的是文件名启发式，两部剧名相近时完全可能撞到一起。
+
+// 组内「尾部副本序号」证据：有的名字带、有的不带（`吞噬星空-245_4K_1` vs `吞噬星空-245 4K`），
+// 或序号不同（`_1` / `_2`）。looseCopySuffix 已经排除了「剧名自带数字」的干扰，
+// 所以这里只比对序号本身；判不出证据的组仍按「无法确认」保留。
+function hasCopySuffixEvidence(group, nameOf) {
+  const suffixes = group.map(f => looseCopySuffix(nameOf(f)));
+  const present = suffixes.filter(Boolean);
+  if (present.length === 0) return false;
+  if (present.length < suffixes.length) return true;
+  return new Set(present.map(s => Number(String(s).replace(/[^\d]/g, '')))).size > 1;
+}
+
 function duplicateEvidence(group, nameOf) {
   const names = group.map(nameOf);
-  if (names.some(n => stripNumericSuffix(n) !== n)) return '有序号副本';
+  if (names.some(n => stripNumericSuffix(n) !== n) || hasCopySuffixEvidence(group, nameOf)) return '有序号副本';
   if (new Set(names.map(getQualityScore)).size > 1) return '画质不同';
   const notations = new Set(group.map(f => getEpisodeGroup(nameOf(f))?.notation));
   if (notations.size > 1) return '季集写法不同';
+  if (names.some(hasUploadTag)) return '剧名带上传标签';
   return null;
 }
 
