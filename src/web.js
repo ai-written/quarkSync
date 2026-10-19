@@ -161,6 +161,12 @@ function validateConfig(c) {
   optionalBool('downloadAfterSync');
   optionalBool('dedupEpisodesInTarget');
   optionalBool('folderPerShow');
+  optionalBool('videoOnly');
+  if (c.videoExtensions !== undefined) {
+    if (!Array.isArray(c.videoExtensions) || c.videoExtensions.some(v => typeof v !== 'string')) {
+      errors.push('videoExtensions 必须是字符串数组（例如 ["mp4","mkv"]）');
+    }
+  }
 
   optionalInt('minFileSizeMB', 0);
   optionalInt('maxFilesPerShare', 0);

@@ -2,4 +2,5 @@ node_modules/
 config.json
 *.log
 .downloaded.json
+.show-folders.json
 downloads/

@@ -282,7 +282,12 @@
               <label>按影视名称分文件夹</label>
               <div>
                 <input type="checkbox" id="folderPerShow">
-                <span class="hint">转存到「目标文件夹/影视名称/影视名称-原名」，下载时在本地重建同样的文件夹结构；清理重复副本时按文件夹分别去重，并删掉变空的影视名称文件夹。旧平铺文件会在同步/下载前自动迁移，文件夹里的裸名文件也会自动补上前缀（清理预览里也会列出）。</span>
+                <span class="hint">转存到「目标文件夹/影视名称/影视名称-原名」，下载时在本地重建同样的文件夹结构；清理重复副本时按文件夹分别去重，并删掉变空的影视名称文件夹。旧平铺文件会在同步/下载前自动迁移，文件夹里的裸名文件也会自动补上前缀（清理预览里也会列出）。改影视名称后，旧文件夹和文件名前缀会自动改成新名字。</span>
+              </div>
+              <label>只处理视频文件</label>
+              <div>
+                <input type="checkbox" id="videoOnly">
+                <span class="hint">默认开启：只转存/下载 mp4/mkv/avi/ts 等视频，压缩包、图片、字幕、nfo 等非视频资源一律跳过。想保留字幕等类型，可在 config.json 的 videoExtensions 里加扩展名（如 ["mp4","srt"]）；完全关闭过滤设 videoOnly: false。</span>
               </div>
             </div>
           </div>
@@ -766,6 +771,8 @@ async function loadConfig() {
   $('downloadAfterSync').checked = c.downloadAfterSync === true;
   // 未设置时默认启用（与后端 config.dedupEpisodesInTarget !== false 一致）
   $('dedupEpisodesInTarget').checked = c.dedupEpisodesInTarget !== false;
+  // 未设置时默认开启（与后端 videoOnly !== false 一致）
+  $('videoOnly').checked = c.videoOnly !== false;
   // 未设置时默认关闭（与后端 config.folderPerShow === true 一致）
   $('folderPerShow').checked = c.folderPerShow === true;
 
@@ -830,6 +837,7 @@ $('saveBtn').onclick = async () => {
   out.downloadAfterSync = $('downloadAfterSync').checked;
   out.dedupEpisodesInTarget = $('dedupEpisodesInTarget').checked;
   out.folderPerShow = $('folderPerShow').checked;
+  out.videoOnly = $('videoOnly').checked;
   out.webHost = $('webHost').value;
 
   const sc = inputToCron($('syncCron').value);
