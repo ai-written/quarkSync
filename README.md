@@ -71,6 +71,7 @@ npm run web      # 网页界面 + 定时任务（推荐）
 | 强制重新下载 | `npm run download-force`、`npm run alist-force` | 忽略已下载记录 |
 | 清理重复（预览） | `npm run dedupe` | 列出网盘与本地同一集多余的副本，**不删任何文件** |
 | 清理重复（执行） | `npm run dedupe-apply` | 真的删除；可加 `--local-only` / `--cloud-only` 只清一边 |
+| 合并/改名影视文件夹 | `npm run merge-folder -- --from 旧名 --to 新名` | 手动把旧文件夹改名/合并到新文件夹（云端 + 本地，文件名前缀一起换）；不加 `--yes` 只预览 |
 
 清理重复副本也可以只清一边：`node src/index.js dedupe --local-only --yes`（只删本地）、`--cloud-only`（只删网盘）。
 

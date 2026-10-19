@@ -2439,6 +2439,7 @@ async function syncInternal(config, opts = {}) {
     try {
       const baseEntries = await client.listTopLevelEntries(targetDirFid);
       const folderTips = [...configTips(config), ...baseEntries.filter(e => e.dir).map(e => e.file_name)];
+      const currentFolders = configShowFolders(config);
       const m = await migrateCloudFlatFiles(client, targetDirFid, folderTips, { apply: true, derive: true });
       if (m.moves.length > 0) {
         log(`   整理: 已迁移 ${m.moves.length} 个平铺文件到影视名称文件夹`);
@@ -2447,7 +2448,7 @@ async function syncInternal(config, opts = {}) {
       for (const c of m.conflicts) logError(`   ⚠ 未迁移（${c.reason}）: ${c.from}`);
       if (m.failed > 0) logError(`   ⚠ 有 ${m.failed} 个文件迁移失败，保持原位（详见上方错误）`);
       // 文件夹里早期版本迁进去的裸名文件补齐「影视名称-」前缀
-      const n = await normalizeCloudFolderNames(client, targetDirFid, [...configShowFolders(config)], { apply: true });
+      const n = await normalizeCloudFolderNames(client, targetDirFid, [...currentFolders], { apply: true });
       if (n.renames.length > 0) {
         log(`   整理: 已给 ${n.renames.length} 个文件补上影视名称前缀`);
         for (const r of n.renames.slice(0, 20)) log(`     ✓ ${r.folder}/${r.from} → ${r.folder}/${r.newName}`);
@@ -2455,6 +2456,16 @@ async function syncInternal(config, opts = {}) {
       }
       for (const c of n.conflicts) logError(`   ⚠ 未补前缀（${c.reason}）: ${c.folder}/${c.from}`);
       for (const f of n.failed) logError(`   ✗ 补前缀失败 ${f.folder}/${f.from}: ${f.reason}`);
+      // 疑似「改名前遗留」的文件夹：不在当前配置影视名称里、也不在映射里，名字又和某个当前文件夹有包含关系
+      const mappedFolders = new Set(Object.values(loadShowFolderMap()));
+      for (const e of baseEntries) {
+        if (!e.dir || currentFolders.has(e.file_name) || mappedFolders.has(e.file_name)) continue;
+        const related = [...currentFolders].find(f => f !== e.file_name && (f.startsWith(e.file_name) || e.file_name.startsWith(f)));
+        if (related) {
+          logError(`   ⚠ 发现疑似改名前遗留的文件夹「${e.file_name}」（可能属于「${related}」）。`
+            + `如确认，可执行: npm run merge-folder -- --from ${e.file_name} --to ${related} --yes`);
+        }
+      }
     } catch (e) {
       logError(`   ✗ 整理旧文件失败（不影响本次同步）: ${e.message}`);
     }
@@ -3775,6 +3786,50 @@ function saveShowFolderMap(map, file = SHOW_FOLDER_MAP_FILE) {
   try { fs.writeFileSync(file, JSON.stringify(map, null, 2)); } catch {}
 }
 
+// 网页保存配置前调用：按 shareUrls 的顺序比较影视名称，把旧名字记进「分享 ID → 文件夹」映射。
+// 这样即使映射是空的（刚升级到支持自动改名的版本、或分享链接被换掉），
+// 下次同步也能按旧名字找到旧文件夹并改名。
+// 安全约束：链接完全换了且新旧名字没有包含关系（可能是两条不同的分享被换了位置）时不猜。
+export function recordShowFolderTipChanges(oldConfig, newConfig, { mapFile = SHOW_FOLDER_MAP_FILE } = {}) {
+  const oldItems = normalizeShareUrls(oldConfig || {});
+  const newItems = normalizeShareUrls(newConfig || {});
+  const oldGlobalTip = String((oldConfig || {}).tip || '').trim();
+  const newGlobalTip = String((newConfig || {}).tip || '').trim();
+  const map = loadShowFolderMap(mapFile);
+  const changes = [];
+  const count = Math.max(oldItems.length, newItems.length);
+  for (let i = 0; i < count; i++) {
+    const oldItem = oldItems[i] || {};
+    const newItem = newItems[i] || {};
+    const oldTip = String(oldItem.tip || '').trim() || oldGlobalTip;
+    const newTip = String(newItem.tip || '').trim() || newGlobalTip;
+    if (!oldTip || !newTip) continue;
+    const oldFolder = showFolderName(oldTip);
+    const newFolder = showFolderName(newTip);
+    if (!oldFolder || !newFolder || oldFolder === newFolder) continue;
+
+    const oldIds = [];
+    for (const u of [].concat(oldItem.url || [])) {
+      try { oldIds.push(parseShareUrl(u)); } catch {}
+    }
+    const newIds = [];
+    for (const u of [].concat(newItem.url || [])) {
+      try { newIds.push(parseShareUrl(u)); } catch {}
+    }
+    const overlap = newIds.some(id => oldIds.includes(id));
+    // 链接换了且名字毫无关系：分不清是不是同一部剧，不猜
+    if (!overlap && !newFolder.startsWith(oldFolder) && !oldFolder.startsWith(newFolder)) continue;
+
+    const ids = [...new Set([...oldIds, ...newIds])];
+    for (const id of ids) {
+      map[id] = oldFolder;
+      changes.push({ id, from: oldFolder, to: newFolder });
+    }
+  }
+  if (changes.length > 0) saveShowFolderMap(map, mapFile);
+  return changes;
+}
+
 // 旧前缀 → 新前缀：`旧名-08.mkv` → `新名-08.mkv`；没有旧前缀的原样补新前缀；已是新前缀的不动
 export function folderRenameName(fileName, oldFolder, newFolder) {
   const oldPrefix = normalizePrefix(oldFolder);
@@ -3787,20 +3842,63 @@ export function folderRenameName(fileName, oldFolder, newFolder) {
 }
 
 // 本地：把 downloadDir 里的旧影视名称文件夹改名成新名字，并把文件夹内/当层旧前缀文件的前缀换掉。
-// 返回 { renamedFolder, renames, moves, conflicts, failed }，改名/移动都会同步更新下载记录键。
-export function renameLocalShowFolder(saveDir, oldFolder, newFolder, { apply = false } = {}) {
-  const result = { renamedFolder: false, renames: [], moves: [], conflicts: [], failed: [] };
+// merge=true 时允许「新旧文件夹同时存在」：把旧文件夹里的文件按新前缀合并进新文件夹，空出来的旧目录删掉。
+// 返回 { renamedFolder, merged, renames, moves, mergedFiles, conflicts, failed }，
+// 改名/移动/合并都会同步更新下载记录键。
+export function renameLocalShowFolder(saveDir, oldFolder, newFolder, { apply = false, merge = false } = {}) {
+  const result = {
+    renamedFolder: false, merged: false, renames: [], moves: [], mergedFiles: [], conflicts: [], failed: [],
+  };
   if (!saveDir || !oldFolder || !newFolder || oldFolder === newFolder) return result;
   const oldDir = path.join(saveDir, oldFolder);
   const newDir = path.join(saveDir, newFolder);
+  const readNames = dir => {
+    try {
+      return fs.readdirSync(dir, { withFileTypes: true })
+        .filter(e => e.isFile() && !e.name.startsWith('.') && !e.name.endsWith('.part'))
+        .map(e => e.name);
+    } catch {
+      return [];
+    }
+  };
   const oldExists = fs.existsSync(oldDir);
   const newExists = fs.existsSync(newDir);
+
+  // 1) 两个文件夹都在：merge=true 时把旧文件夹里的文件合并进新文件夹；否则只记冲突
   if (oldExists && newExists) {
-    result.conflicts.push(`本地「${oldFolder}」和「${newFolder}」两个文件夹同时存在，未自动合并，请手动处理`);
-    return result;
+    if (!merge) {
+      result.conflicts.push(`本地「${oldFolder}」和「${newFolder}」两个文件夹同时存在，未自动合并，请手动处理`);
+      return result;
+    }
+    result.merged = true;
+    const inNew = new Set(readNames(newDir));
+    for (const name of readNames(oldDir)) {
+      const target = folderRenameName(name, oldFolder, newFolder);
+      if (inNew.has(target)) {
+        result.conflicts.push(`本地目标已存在: ${newFolder}/${target}`);
+        continue;
+      }
+      result.mergedFiles.push({ from: name, to: target });
+      inNew.add(target);
+    }
+    if (apply) {
+      const done = [];
+      for (const m of result.mergedFiles) {
+        try {
+          fs.renameSync(path.join(oldDir, m.from), path.join(newDir, m.to));
+          done.push(m);
+        } catch (e) {
+          result.failed.push(`本地合并 ${oldFolder}/${m.from} → ${newFolder}/${m.to}: ${e.message}`);
+        }
+      }
+      result.mergedFiles = done;
+      try {
+        if (fs.readdirSync(oldDir).length === 0) fs.rmdirSync(oldDir);
+      } catch {}
+    }
   }
 
-  // 1) 文件夹改名（旧存在、新不存在时）
+  // 2) 文件夹改名（旧存在、新不存在时）
   if (oldExists && !newExists) {
     if (apply) {
       try {
@@ -3814,15 +3912,6 @@ export function renameLocalShowFolder(saveDir, oldFolder, newFolder, { apply = f
   }
 
   const dirPath = oldExists || newExists ? newDir : null;
-  const readNames = dir => {
-    try {
-      return fs.readdirSync(dir, { withFileTypes: true })
-        .filter(e => e.isFile() && !e.name.startsWith('.') && !e.name.endsWith('.part'))
-        .map(e => e.name);
-    } catch {
-      return [];
-    }
-  };
   // 预览时文件夹还没改名，从旧目录读；apply 时已改名，从新目录读
   const names = dirPath ? readNames(apply || newExists ? newDir : oldDir) : [];
 
@@ -3915,6 +4004,11 @@ export function renameLocalShowFolder(saveDir, oldFolder, newFolder, { apply = f
         removeOld(m.from, '');
         addNew(m.to);
       }
+      // 从旧文件夹合并进来的文件：记录键从旧目录换成新目录（文件名可能也变了）
+      for (const m of result.mergedFiles) {
+        removeOld(m.from, oldFolder);
+        addNew(m.to);
+      }
       if (changed) saveDownloadedRecord(saveDir, record);
     } catch {}
   }
@@ -3922,29 +4016,79 @@ export function renameLocalShowFolder(saveDir, oldFolder, newFolder, { apply = f
 }
 
 // 云端：旧影视名称文件夹改名成新名字 + 文件夹内/当层旧前缀文件换前缀。
-// 新文件夹已存在时不做自动合并（避免动到用户文件），只记冲突等人工处理。
-export async function renameCloudShowFolder(client, targetDirFid, oldFolder, newFolder) {
-  const result = { renamedFolder: false, renames: [], conflicts: [], failed: [] };
+// merge=true 时允许新旧文件夹同时存在：把旧文件夹里的文件按新前缀合并进新文件夹，
+// 空出来的旧文件夹删掉（删除前会再列一次确认是空的）。
+export async function renameCloudShowFolder(client, targetDirFid, oldFolder, newFolder, { merge = false, apply = true } = {}) {
+  const result = {
+    renamedFolder: false, merged: false, renames: [], mergedFiles: [], conflicts: [], failed: [],
+  };
   let oldFid = null;
   let newFid = null;
   try { oldFid = await client.findFolderByName(oldFolder, targetDirFid); } catch {}
   try { newFid = await client.findFolderByName(newFolder, targetDirFid); } catch {}
+
+  // 1) 两个文件夹都在：merge=true 时合并，否则只记冲突
   if (oldFid && newFid) {
-    result.conflicts.push(`云端「${oldFolder}」和「${newFolder}」两个文件夹同时存在，未自动合并，请手动处理`);
-    return result;
-  }
-  if (oldFid && !newFid) {
-    try {
-      await client.renameFile(oldFid, newFolder);
-      newFid = oldFid;
-      result.renamedFolder = true;
-    } catch (e) {
-      result.failed.push(`云端文件夹改名 ${oldFolder} → ${newFolder}: ${e.message}`);
+    if (!merge) {
+      result.conflicts.push(`云端「${oldFolder}」和「${newFolder}」两个文件夹同时存在，未自动合并，请手动处理`);
       return result;
+    }
+    result.merged = true;
+    let oldFiles = [];
+    const newNames = new Set();
+    try { oldFiles = await client.listAllUserFiles(oldFid); } catch (e) { result.failed.push(`列出 ${oldFolder}/ 失败: ${e.message}`); }
+    try {
+      for (const f of await client.listAllUserFiles(newFid)) newNames.add(f.file_name);
+    } catch (e) {
+      result.failed.push(`列出 ${newFolder}/ 失败: ${e.message}`);
+    }
+    for (const f of oldFiles) {
+      const target = folderRenameName(f.file_name, oldFolder, newFolder);
+      if (newNames.has(target)) {
+        result.conflicts.push(`云端目标已存在: ${newFolder}/${target}`);
+        continue;
+      }
+      result.mergedFiles.push({ from: f.file_name, to: target, fid: f.fid });
+      newNames.add(target);
+    }
+    if (apply) {
+      const done = [];
+      for (const m of result.mergedFiles) {
+        try {
+          await client.renameFile(m.fid, m.to);
+          await client.moveFiles([m.fid], newFid);
+          done.push(m);
+        } catch (e) {
+          result.failed.push(`云端合并 ${oldFolder}/${m.from} → ${newFolder}/${m.to}: ${e.message}`);
+        }
+      }
+      result.mergedFiles = done;
+      try {
+        if ((await client.listAllUserFiles(oldFid)).length === 0) await client.deleteFiles([oldFid]);
+      } catch (e) {
+        result.failed.push(`删除空文件夹 ${oldFolder} 失败: ${e.message}`);
+      }
     }
   }
 
-  // 文件夹内文件前缀替换
+  // 2) 文件夹改名（旧存在、新不存在时）
+  if (oldFid && !newFid) {
+    if (!apply) {
+      newFid = oldFid;
+      result.renamedFolder = true;
+    } else {
+      try {
+        await client.renameFile(oldFid, newFolder);
+        newFid = oldFid;
+        result.renamedFolder = true;
+      } catch (e) {
+        result.failed.push(`云端文件夹改名 ${oldFolder} → ${newFolder}: ${e.message}`);
+        return result;
+      }
+    }
+  }
+
+  // 3) 文件夹内文件前缀替换
   if (newFid) {
     let files = [];
     try { files = await client.listAllUserFiles(newFid); } catch (e) { result.failed.push(`列出 ${newFolder}/ 失败: ${e.message}`); }
@@ -3956,9 +4100,13 @@ export async function renameCloudShowFolder(client, targetDirFid, oldFolder, new
         result.conflicts.push(`云端目标已存在: ${newFolder}/${target}`);
         continue;
       }
+      existing.add(target);
+      if (!apply) {
+        result.renames.push({ from: f.file_name, to: `${newFolder}/${target}` });
+        continue;
+      }
       try {
         await client.renameFile(f.fid, target);
-        existing.add(target);
         result.renames.push({ from: f.file_name, to: `${newFolder}/${target}` });
       } catch (e) {
         result.failed.push(`云端改名 ${f.file_name} → ${target}: ${e.message}`);
@@ -3966,24 +4114,28 @@ export async function renameCloudShowFolder(client, targetDirFid, oldFolder, new
     }
   }
 
-  // 当层旧前缀平铺文件搬进新文件夹并换前缀
+  // 4) 当层旧前缀平铺文件搬进新文件夹并换前缀
   try {
     const base = await client.listTopLevelEntries(targetDirFid);
     const oldPrefix = normalizePrefix(oldFolder);
     const flats = base.filter(e => !e.dir && String(e.file_name || '').startsWith(oldPrefix));
     if (flats.length > 0) {
-      const fid = newFid || await client.ensureSubfolder(targetDirFid, newFolder);
-      const inFolder = new Set((await client.listAllUserFiles(fid)).map(f => f.file_name));
+      const fid = newFid || (apply ? await client.ensureSubfolder(targetDirFid, newFolder) : null);
+      const inFolder = new Set(fid ? (await client.listAllUserFiles(fid)).map(f => f.file_name) : []);
       for (const f of flats) {
         const target = folderRenameName(f.file_name, oldFolder, newFolder);
         if (inFolder.has(target)) {
           result.conflicts.push(`云端目标已存在: ${newFolder}/${target}`);
           continue;
         }
+        inFolder.add(target);
+        if (!apply) {
+          result.renames.push({ from: f.file_name, to: `${newFolder}/${target}` });
+          continue;
+        }
         try {
           await client.renameFile(f.fid, target);
           await client.moveFiles([f.fid], fid);
-          inFolder.add(target);
           result.renames.push({ from: f.file_name, to: `${newFolder}/${target}` });
         } catch (e) {
           result.failed.push(`云端搬入 ${f.file_name} → ${newFolder}/${target}: ${e.message}`);
@@ -4178,6 +4330,90 @@ async function dedupeMode(apply, opts = {}) {
   if (!apply) log('\n提示: 确认清单无误后执行删除：npm run dedupe-apply（或 node src/index.js dedupe --yes）\n');
 }
 
+// 手动合并 / 改名影视名称文件夹（云端 + 本地）。用于两种自动改名覆盖不到的情况：
+// - 升级到支持改名之前，就已经把影视名称改掉了（映射里没有旧名字）；
+// - 旧、新两个文件夹同时存在，需要人工指认后合并。
+// 默认只预览，加 --yes 才真的执行；文件名前缀会一起换成新影视名称。
+async function mergeFolderMode(from, to, apply) {
+  const config = loadConfigOrExit();
+  const oldFolder = showFolderName(from);
+  const newFolder = showFolderName(to);
+  if (!oldFolder || !newFolder || oldFolder === newFolder) {
+    logError('用法: node src/index.js merge-folder --from 旧影视名称 --to 新影视名称 [--yes]');
+    logError('  不加 --yes 只预览；确认清单后加 --yes 才会真的改名/合并（云端 + 本地）');
+    process.exit(1);
+  }
+  log(`=== 合并影视名称文件夹: ${oldFolder} → ${newFolder}${apply ? '' : '（预览，不会改动任何文件）'} ===\n`);
+  let hasError = false;
+
+  if (!config.cookie) {
+    logError('   ⚠ 未配置 cookie，跳过云端合并');
+  } else {
+    try {
+      const client = new QuarkClient(config.cookie);
+      const nickname = await client.checkLogin();
+      if (!nickname) throw new Error('Cookie 无效或已过期！请重新从浏览器获取 Cookie');
+      const targetDirFid = await client.resolveTargetDir(config);
+      const r = await renameCloudShowFolder(client, targetDirFid, oldFolder, newFolder, { merge: true, apply });
+      log(`   云端: ${r.merged ? '合并' : r.renamedFolder ? '改名' : '未发现同名文件夹'}${apply ? '' : '（预览）'}`);
+      for (const x of r.renames.slice(0, 30)) log(`     ${apply ? '✓' : '·'} ${x.from} → ${x.to}`);
+      if (r.renames.length > 30) log(`     …共 ${r.renames.length} 个`);
+      for (const m of r.mergedFiles.slice(0, 30)) log(`     ${apply ? '✓' : '·'} ${oldFolder}/${m.from} → ${newFolder}/${m.to}`);
+      if (r.mergedFiles.length > 30) log(`     …共 ${r.mergedFiles.length} 个`);
+      for (const c of r.conflicts) logError(`   ⚠ 云端 ${c}`);
+      for (const f of r.failed) {
+        hasError = true;
+        logError(`   ✗ 云端 ${f}`);
+      }
+    } catch (e) {
+      hasError = true;
+      logError(`   ✗ 云端合并失败: ${e.message}`);
+    }
+  }
+
+  const dir = String(config.downloadDir || '').trim();
+  if (!dir) {
+    logError('   ⚠ 未配置 downloadDir，跳过本地合并');
+  } else {
+    const saveDir = path.resolve(dir);
+    if (!fs.existsSync(saveDir)) {
+      log(`   本地目录不存在（${saveDir}），跳过`);
+    } else {
+      const r = renameLocalShowFolder(saveDir, oldFolder, newFolder, { merge: true, apply });
+      log(`   本地: ${r.merged ? '合并' : r.renamedFolder ? '改名' : '未发现同名文件夹'}${apply ? '' : '（预览）'}`);
+      for (const x of r.renames.slice(0, 30)) log(`     ${apply ? '✓' : '·'} ${x.from} → ${x.to}`);
+      if (r.renames.length > 30) log(`     …共 ${r.renames.length} 个`);
+      for (const m of r.mergedFiles.slice(0, 30)) log(`     ${apply ? '✓' : '·'} ${oldFolder}/${m.from} → ${newFolder}/${m.to}`);
+      if (r.mergedFiles.length > 30) log(`     …共 ${r.mergedFiles.length} 个`);
+      for (const m of r.moves.slice(0, 30)) log(`     ${apply ? '✓' : '·'} 搬入 ${m.from} → ${newFolder}/${m.to}`);
+      for (const c of r.conflicts) logError(`   ⚠ 本地 ${c}`);
+      for (const f of r.failed) {
+        hasError = true;
+        logError(`   ✗ 本地 ${f}`);
+      }
+    }
+  }
+
+  if (apply) {
+    // 映射里还指向旧文件夹的分享改成新名字，后续同步不会再去改旧名字
+    try {
+      const map = loadShowFolderMap();
+      let changed = false;
+      for (const [id, folder] of Object.entries(map)) {
+        if (folder === oldFolder) {
+          map[id] = newFolder;
+          changed = true;
+        }
+      }
+      if (changed) saveShowFolderMap(map);
+    } catch {}
+    log(hasError ? '\n完成（有失败项，详见上方日志）' : '\n完成');
+  } else {
+    log('\n提示: 确认清单无误后加 --yes 才会真的执行（云端 + 本地一起）\n');
+  }
+  if (hasError) process.exitCode = 1;
+}
+
 function main() {
   const mode = process.argv[2];
   const forceDownload = process.argv.includes('--force-download') || process.argv.includes('--no-skip');
@@ -4186,9 +4422,14 @@ function main() {
   const applyDedupe = process.argv.includes('--yes') && !dryRun;
   const cloudOnly = process.argv.includes('--cloud-only');
   const localOnly = process.argv.includes('--local-only');
+  const mergeApply = process.argv.includes('--yes') && !dryRun;
+  const flagValue = name => {
+    const i = process.argv.indexOf(name);
+    return i >= 0 ? (process.argv[i + 1] || '') : '';
+  };
 
   // --dry-run 目前只实现在同步模式：其他模式若静默忽略它，用户会误以为「没写入」
-  const nonSyncModes = ['--download', 'download', '--schedule', 'schedule', '--alist', 'alist', '--web', 'web'];
+  const nonSyncModes = ['--download', 'download', '--schedule', 'schedule', '--alist', 'alist', '--web', 'web', 'merge-folder', '--merge-folder'];
   if (dryRun && nonSyncModes.includes(mode)) {
     logError('错误: --dry-run 只支持同步模式，例如: node src/index.js --dry-run（或 npm run sync-dry）');
     process.exit(1);
@@ -4196,6 +4437,11 @@ function main() {
 
   if (mode === '--dedupe' || mode === 'dedupe') {
     dedupeMode(applyDedupe, { cloud: !localOnly, local: !cloudOnly }).catch(err => {
+      logError('\n程序异常: ' + err.message);
+      process.exit(1);
+    });
+  } else if (mode === '--merge-folder' || mode === 'merge-folder') {
+    mergeFolderMode(flagValue('--from'), flagValue('--to'), mergeApply).catch(err => {
       logError('\n程序异常: ' + err.message);
       process.exit(1);
     });

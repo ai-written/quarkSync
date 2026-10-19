@@ -11,6 +11,7 @@ import {
   log,
   logError,
   runSync,
+  runSyncThenDownload,
   runAlist,
   runDedupe,
   listScheduledTasks,
@@ -18,6 +19,7 @@ import {
   getRunningTasks,
   isTaskRunning,
   isValidDuration,
+  recordShowFolderTipChanges,
   VERSION,
 } from './index.js';
 
@@ -268,7 +270,13 @@ async function triggerTask(key) {
   const k = String(key);
   // 试运行：只列出会转存哪些文件，不做任何写入
   if (k === 'sync-dry') return runSync(undefined, { dryRun: true });
-  if (k === 'sync' || k.startsWith('sync:')) return runSync();
+  if (k === 'sync') return runSync();
+  // 定时任务里的 sync:N 要和 cron 触发保持一致：开了 downloadAfterSync 时
+  // 「同步 + AList下载」点立即执行也要接着下载，不能只跑同步
+  if (k.startsWith('sync:')) {
+    const cfg = loadConfig();
+    return cfg.downloadAfterSync === true ? runSyncThenDownload(cfg) : runSync(cfg);
+  }
   if (k === 'alist' || k.startsWith('alist:')) return runAlist();
   // 清理重复副本：预览安全，apply 会真的删除云端与本地文件
   if (k === 'dedupe') return runDedupe(undefined, { apply: false });
@@ -422,6 +430,12 @@ function createServer() {
         if (errors.length > 0) {
           sendJson(res, 400, { error: '配置校验失败', details: errors });
           return;
+        }
+        // 改影视名称前先把旧名字记进映射：下次同步自动把旧文件夹改名
+        const tipChanges = recordShowFolderTipChanges(current, merged);
+        if (tipChanges.length > 0) {
+          const pairs = [...new Set(tipChanges.map(c => `${c.from} → ${c.to}`))];
+          log(`   已记录影视名称变更: ${pairs.join('，')}（下次同步自动改文件夹名）`);
         }
         let saved;
         try {
