@@ -1,6 +1,6 @@
 {
   "name": "quark-sync",
-  "version": "1.12.3",
+  "version": "1.12.4",
   "description": "自动从夸克网盘分享链接中提取最近两天更新的文件并转存到自己的网盘",
   "main": "src/index.js",
   "type": "module",
@@ -16,6 +16,7 @@
     "sync-dry": "node src/index.js --dry-run",
     "dedupe": "node src/index.js dedupe",
     "dedupe-apply": "node src/index.js dedupe --yes",
+    "merge-folder": "node src/index.js merge-folder",
     "test": "node --test",
     "docker:build": "node scripts/docker-build.mjs",
     "docker:build:local": "node scripts/docker-build.mjs --no-push --platform linux/amd64"
