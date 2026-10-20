@@ -238,6 +238,7 @@ const SUMMARY_KEEP = [
   /^=+ .*=+ *$/m,                     // === 任务标题 / 结果汇总分隔线 ===
   /^═+$/m,                            // ═══ 分隔线：正式运行分隔各分享、试运行围住清单（LOG_RULE）
   /^\[启动任务\]/m,                    // web 启动后补跑的首次同步、下载
+  /^\[周几\]/m,                        // 定时任务按「周几更新」过滤：今天同步了哪些、跳过了什么
   /^网页/m,                            // 登录、退出、改配置、手动触发、任务结果
   /^正在关闭/m,
   /触发: /m,                           // 定时任务被触发
@@ -1705,9 +1706,14 @@ export class QuarkClient {
     return groups;
   }
 
-  async downloadAllFromFolder(pdirFid, saveDir, skipExisting = true, deleteAfter = false, { flatten = false, tips = [], keepFile = () => true } = {}) {
+  async downloadAllFromFolder(pdirFid, saveDir, skipExisting = true, deleteAfter = false, { flatten = false, tips = [], keepFile = () => true, onlyTips = null } = {}) {
     log(`   列出目标文件夹中的文件...`);
-    const groups = await this.collectDownloadGroups(pdirFid, { flatten });
+    let groups = await this.collectDownloadGroups(pdirFid, { flatten });
+    // 单分享下载：只保留该分享影视名称对应的文件，其余分享的内容不碰
+    if (onlyTips && onlyTips.length > 0) {
+      groups = filterDownloadGroupsByTips(groups, onlyTips, { flatten });
+      log(`   只下载影视名称匹配的文件: ${onlyTips.join('、')}`);
+    }
     const rawCount = groups.reduce((n, g) => n + g.files.length, 0);
     if (rawCount === 0) {
       log(`   目标文件夹是空的，无需下载。`);
@@ -2390,8 +2396,10 @@ export async function collectExistingForShare(client, { baseFid, folderFid, pref
 }
 
 // 统一同步实现：CLI(sync 模式) 与 cron/网页触发共用同一份逻辑
+// opts.shareIndex：只处理指定分享（0 起，基于 normalizeShareUrls 的顺序；网页单分享按钮/CLI --share 用）
+// opts.dayFilter：定时任务按「周几更新」过滤，只同步今天该同步的分享（手动触发不传，保持全量）
 async function syncInternal(config, opts = {}) {
-  const { dryRun = false } = opts;
+  const { dryRun = false, dayFilter = false, shareIndex = null } = opts;
   // 试运行只回答「会转存哪些文件」：整个流程静音进度日志，只保留 logError 与函数末尾那份清单。
   // 这里自我包裹一次即可（第二遍进来时 store 已存在，不会递归）；
   // opts 原样透传，避免以后新增选项在这里被静默丢掉。
@@ -2403,9 +2411,41 @@ async function syncInternal(config, opts = {}) {
     throw new Error('请在 config.json 中填写有效的 Cookie');
   }
 
-  const shareUrls = normalizeShareUrls(config);
-  if (shareUrls.length === 0) {
+  const allShares = normalizeShareUrls(config);
+  if (allShares.length === 0) {
     throw new Error('请在 config.json 中填写 shareUrl 或 shareUrls');
+  }
+
+  // 本轮要处理的分享（保留配置里的原始下标，日志与「第 N 个分享」都用它）
+  let shares = allShares.map((share, index) => ({ share, index }));
+  // 配置里没有「周几更新」这一层时，定时任务仍然每天全量同步；
+  // 只有勾了周几的分享才会被过滤掉。手动的单分享/全量同步都不做这层过滤。
+  const weekday = weekdayOf();
+  if (shareIndex !== null && shareIndex !== undefined) {
+    if (!Number.isInteger(shareIndex) || shareIndex < 0 || shareIndex >= allShares.length) {
+      throw new Error(`第 ${Number(shareIndex) + 1} 个分享不存在（共 ${allShares.length} 个）`);
+    }
+    shares = [{ share: allShares[shareIndex], index: shareIndex }];
+    log(`只同步第 ${shareIndex + 1} 个分享：${shareLabel(allShares[shareIndex])}`);
+  } else if (dayFilter) {
+    const { active, skipped } = filterSharesForWeekday(allShares, weekday);
+    // 今天没有要同步的分享：连登录态都不用验证，直接返回 ——
+    // 用户配置周几就是为了省掉这些无意义的查询，这里是最主要的收益点。
+    if (active.length === 0) {
+      log(`[周几] 今天（${WEEKDAY_LABELS[weekday - 1]}）没有需要同步的分享，`
+        + `跳过同步（${allShares.length} 个分享都未安排在今天更新）`);
+      return {
+        skippedByDay: true, weekday, processedShares: 0,
+        totalSuccess: 0, totalFailed: 0, allSuccess: [], allFailed: [],
+        deadPwdIds: [], prunedUrls: null,
+      };
+    }
+    shares = active;
+    const skippedText = skipped.slice(0, 10)
+      .map(({ share }) => `${shareLabel(share)}（${updateDaysLabel(share.updateDays)}）`)
+      .join('、') + (skipped.length > 10 ? '…' : '');
+    log(`[周几] 今天（${WEEKDAY_LABELS[weekday - 1]}）按配置同步 ${active.length} 个分享`
+      + `，跳过 ${skipped.length} 个${skipped.length > 0 ? `：${skippedText}` : ''}`);
   }
 
   // 时间窗口支持 1h / 1d / 1w / 1mo / 1y / 30m 等单位写法（纯数字按小时，兼容旧配置）。
@@ -2482,18 +2522,27 @@ async function syncInternal(config, opts = {}) {
   const deadPwdIds = new Set();
   let prunedUrls = null;
 
-  for (let si = 0; si < shareUrls.length; si++) {
-    const { url, password, tip, hours: itemHours, minFileSizeMB: itemMinSizeMB, maxFilesPerShare: itemMaxFiles } = shareUrls[si];
+  for (let si = 0; si < shares.length; si++) {
+    const { share, index: shareNo0 } = shares[si];
+    const shareNo = shareNo0 + 1;
+    const { url, password, tip, hours: itemHours, minFileSizeMB: itemMinSizeMB, maxFilesPerShare: itemMaxFiles, updateDays } = share;
     const shareTip = tip || config.tip;
     // 每项分享也可单独覆盖时间窗口，同样支持单位写法
     let shareHours = hours;
     if (itemHours !== undefined && itemHours !== null && itemHours !== '') {
       shareHours = parseDurationHours(itemHours, hours);
       if (!isValidDuration(itemHours)) {
-        logError(`   ⚠ 第 ${si + 1} 个分享的 hours 无法识别: ${JSON.stringify(itemHours)}，`
+        logError(`   ⚠ 第 ${shareNo} 个分享的 hours 无法识别: ${JSON.stringify(itemHours)}，`
           + `已回退为 ${formatHours(hours)}`);
       }
     }
+    // 配了「周几更新」的分享可能一周才查一次：窗口必须至少覆盖两次同步之间的最大间隔，
+    // 否则周更分享只在某个星期同步时，其它天发布的集数会永远落在窗口外漏掉。
+    // 放宽后多列出的文件会被「同一集已存在」去重拦住，不会重复转存。
+    const shareDays = normalizeUpdateDays(updateDays);
+    const widenedHours = effectiveShareHours(shareHours, shareDays);
+    const widened = widenedHours > shareHours;
+    if (widened) shareHours = widenedHours;
     // 跳过空链接条目（可能是上次清理后留下的占位），并解析失败的链接，
     // 二者都不应中断整个循环
     const rawIds = Array.isArray(url) ? url : (url ? [url] : []);
@@ -2506,19 +2555,23 @@ async function syncInternal(config, opts = {}) {
       }
     }
     if (pwdIds.length === 0) {
-      logError(`   ⚠ 第 ${si + 1} 个分享没有可用链接，已跳过`);
+      logError(`   ⚠ 第 ${shareNo} 个分享没有可用链接，已跳过`);
       continue;
     }
     const passcode = password || config.password || '';
 
-    if (shareUrls.length > 1) {
+    // 只处理了部分分享（周几过滤 / 单分享）时补上「配置第 N 个」，
+    // 否则「处理第 1/2 个分享」在配置里有 5 条时会让人对不上号
+    const positionNote = shares.length === allShares.length ? '' : `（配置第 ${shareNo} 个）`;
+    if (shares.length > 1) {
       log(`\n${LOG_RULE}`);
-      log(`处理第 ${si + 1}/${shareUrls.length} 个分享`);
+      log(`处理第 ${si + 1}/${shares.length} 个分享${positionNote}`);
       log(`分享 ID: ${pwdIds.join(', ')}${shareTip ? `  (前缀: ${shareTip})` : ''}`);
     } else {
       log(`分享 ID: ${pwdIds.join(', ')}${shareTip ? `  (前缀: ${shareTip})` : ''}`);
     }
-    log(`时间范围: 最近 ${formatHours(shareHours)}更新\n`);
+    log(`时间范围: 最近 ${formatHours(shareHours)}更新`
+      + (widened ? `（按「周几更新」放宽，避免漏集）` : '') + '\n');
 
     // 影视名称改过名：把上次用的旧文件夹（云端 + 本地）改名成新名字，并一起换掉文件名前缀。
     // 放在「本分享有没有待转存文件」判断之前：即使这段时间没有新集数，也要能把文件夹改过来。
@@ -2762,16 +2815,17 @@ async function syncInternal(config, opts = {}) {
     logAlways(`共 ${dryRunWouldTransfer} 个文件会被转存（试运行，未做任何写入）`);
     logAlways(LOG_RULE);
     return {
-      dryRun: true, wouldTransfer: dryRunWouldTransfer,
+      dryRun: true, wouldTransfer: dryRunWouldTransfer, skippedByDay: false,
+      processedShares: shares.length,
       totalSuccess: 0, totalFailed: 0, allSuccess: [], allFailed: [],
       deadPwdIds: [...deadPwdIds], prunedUrls: null,
     };
   }
 
-  if (shareUrls.length > 1) {
+  if (shares.length > 1) {
     log(`\n${LOG_RULE}`);
     log('=== 全部转存结果汇总 ===');
-    log(`共处理 ${shareUrls.length} 个分享，成功: ${totalSuccess} 个，失败: ${totalFailed} 个`);
+    log(`共处理 ${shares.length} 个分享，成功: ${totalSuccess} 个，失败: ${totalFailed} 个`);
     if (allSuccess.length > 0) {
       log('\n成功转存的文件列表:');
       for (const name of allSuccess) log(`  ✓ ${name}`);
@@ -2818,7 +2872,9 @@ async function syncInternal(config, opts = {}) {
     log('   （未开启 pruneDeadShares，仅报告不修改配置）');
   }
 
-  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
+  // 单分享同步（网页某一行 / CLI --share）不跑全局清理：清理会删掉云端与本地超过保留期
+  // 的文件，点一行「同步」不该顺带触发一次删除；定时全量同步照旧执行。
+  if (shareIndex === null && config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
     const cloudResult = await client.cleanupOldFiles(targetDirFid, config.cleanupAfterDays);
     const localResult = cleanupLocalFiles(path.resolve(config.downloadDir || '.'), config.cleanupAfterDays, { folders: config.folderPerShow === true, folderNames: config.folderPerShow === true ? configShowFolders(config) : null });
@@ -2828,14 +2884,18 @@ async function syncInternal(config, opts = {}) {
     log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
   }
 
-  return { totalSuccess, totalFailed, allSuccess, allFailed, deadPwdIds: [...deadPwdIds], prunedUrls };
+  return {
+    skippedByDay: false, processedShares: shares.length,
+    totalSuccess, totalFailed, allSuccess, allFailed,
+    deadPwdIds: [...deadPwdIds], prunedUrls,
+  };
 }
 
 // CLI 入口：保持原有日志与退出语义
-async function syncMode(dryRun = false) {
+async function syncMode(dryRun = false, shareIndex = null) {
   log(dryRun ? '=== 夸克网盘自动同步工具（试运行） ===\n' : '=== 夸克网盘自动同步工具 ===\n');
   const config = loadConfigOrExit();
-  await withTaskLock('sync', () => syncInternal(config, { dryRun }));
+  await withTaskLock('sync', () => syncInternal(config, { dryRun, shareIndex }));
 }
 
 // cron / 网页触发入口：每次执行前重新读取配置（支持热更新）
@@ -2853,10 +2913,17 @@ export async function runSync(config, opts) {
 //
 // 整个过程同时持有 sync 与 alist 两把锁，因此期间定时的独立 alist 任务、
 // 或网页手动触发都不会插进来并发执行。
-export async function runSyncThenDownload(config) {
+export async function runSyncThenDownload(config, opts = {}) {
   const cfg = config ?? loadConfig();
   return withTaskLock('sync', () => withTaskLock('alist', async () => {
-    const syncResult = await syncInternal(cfg);
+    const syncResult = await syncInternal(cfg, opts);
+
+    // 定时任务按「周几更新」过滤后今天没有要同步的分享：下载也一并跳过，
+    // 否则同步省下的查询量又被一次无意义的全量下载抵消掉了。
+    if (syncResult.skippedByDay) {
+      log(`[周几] 今天没有需要同步的分享，跳过下载`);
+      return syncResult;
+    }
 
     if (!cfg.alistUrl) {
       logError('   ⚠ 已开启 downloadAfterSync 但未配置 alistUrl，跳过同步后的下载');
@@ -2870,6 +2937,43 @@ export async function runSyncThenDownload(config) {
     }
     return syncResult;
   }));
+}
+
+// 单个分享的「同步 + 下载」（网页每行的「同步 / 同步+下载」与 CLI --share 共用）。
+// 下载只取该分享对应的文件：按影视名称前缀/文件夹过滤，不会顺带下载别的分享。
+// 下载来源与定时任务一致：配置了 AList 就走 AList，否则直接下载网盘文件。
+// forceDownload：忽略已下载记录强制重下（仅 CLI --force-download 用）。
+export async function runShareSyncThenDownload(config, { shareIndex, download = true, forceDownload = false } = {}) {
+  const cfg = config ?? loadConfig();
+  // 下载复用 "alist" 这把进程内锁（它是「下载任务」的通用锁名），
+  // 让网页/定时触发的下载不会并发跑。
+  const work = async () => {
+    const result = await syncInternal(cfg, { shareIndex });
+    if (!download) return result;
+
+    const share = normalizeShareUrls(cfg)[shareIndex];
+    const tip = String((share && share.tip) || cfg.tip || '').trim();
+    if (!tip) {
+      // 没有影视名称就无法从目标文件夹/AList 目录里认出哪些文件属于这个分享，
+      // 宁可跳过也不做一次全量下载（那与「只下载这个分享」的预期相反）。
+      logError('   ⚠ 该分享未填写「影视名称」，无法只下载该分享的文件，已跳过下载');
+      return result;
+    }
+    try {
+      if (cfg.alistUrl) {
+        await alistInternal(cfg, { onlyTips: [tip], skipExisting: !forceDownload });
+      } else {
+        await quarkDownloadInternal(cfg, { onlyTips: [tip], forceDownload });
+      }
+    } catch (e) {
+      // 同步本身已经成功，下载失败不应让整个单分享任务算作失败
+      logError(`   ✗ 同步后的下载失败: ${e.message}`);
+    }
+    return result;
+  };
+  return download
+    ? withTaskLock('sync', () => withTaskLock('alist', work))
+    : withTaskLock('sync', work);
 }
 
 // 下载前整理本地旧文件：开启分文件夹后，把 downloadDir 当层带「影视名称-」前缀的
@@ -2898,12 +3002,14 @@ function migrateLocalBeforeDownload(config, saveDir) {
   }
 }
 
-async function downloadMode(forceDownload = false) {
-  const config = loadConfig();
+// 夸克网盘 → 本地的下载主体：CLI 的 download 模式与网页「同步+下载」共用。
+// onlyTips 非空时只下载这些影视名称对应的文件（单分享下载）。
+// 这里不拿跨进程锁、也不退出进程：CLI 由 downloadMode 包一层，
+// 网页侧由进程内任务锁保证互斥。
+async function quarkDownloadInternal(config, { forceDownload = false, onlyTips = null } = {}) {
   const client = new QuarkClient(config.cookie);
   const saveDir = path.resolve(config.downloadDir || '.');
   if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
-  acquireLock('.download.lock', saveDir);
 
   log('=== 夸克网盘下载到本地 ===\n');
 
@@ -2911,7 +3017,9 @@ async function downloadMode(forceDownload = false) {
   const nickname = await client.checkLogin();
   if (!nickname) {
     logError('   ✗ Cookie 无效或已过期！');
-    process.exit(1);
+    // 以前这里直接 process.exit(1)（只在 CLI 里跑）。现在网页「单分享同步+下载」
+    // 也走这条路，退出进程会连带停掉网页服务，因此改成抛错由调用方处理。
+    throw new Error('Cookie 无效或已过期！请重新从浏览器获取 Cookie');
   }
 
   log('1. 确定目标文件夹...');
@@ -2922,13 +3030,21 @@ async function downloadMode(forceDownload = false) {
   const skipExisting = !forceDownload;
   migrateLocalBeforeDownload(config, saveDir);
   await client.downloadAllFromFolder(targetDirFid, saveDir, skipExisting, config.deleteAfterDownload,
-    { flatten: config.folderPerShow !== true, tips: config.folderPerShow === true ? configTips(config) : [], keepFile: name => shouldKeepFile(name, config) });
+    { flatten: config.folderPerShow !== true, tips: config.folderPerShow === true ? configTips(config) : [], keepFile: name => shouldKeepFile(name, config), onlyTips });
 
   if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
     const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays, { folders: config.folderPerShow === true, folderNames: config.folderPerShow === true ? configShowFolders(config) : null });
     log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
   }
+}
+
+async function downloadMode(forceDownload = false) {
+  const config = loadConfig();
+  const saveDir = path.resolve(config.downloadDir || '.');
+  if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+  acquireLock('.download.lock', saveDir);
+  await quarkDownloadInternal(config, { forceDownload });
 }
 
 class AlistClient {
@@ -3038,9 +3154,14 @@ class AlistClient {
     return groups;
   }
 
-  async downloadDir(alistPath, saveDir, skipExisting = true, deleteAfter = false, { flatten = false, tips = [], keepFile = () => true } = {}) {
+  async downloadDir(alistPath, saveDir, skipExisting = true, deleteAfter = false, { flatten = false, tips = [], keepFile = () => true, onlyTips = null } = {}) {
     log(`   列出文件夹: ${alistPath} ...`);
-    const groups = await this.collectDownloadGroups(alistPath, { flatten });
+    let groups = await this.collectDownloadGroups(alistPath, { flatten });
+    // 单分享下载：只保留该分享影视名称对应的文件，其余分享的内容不碰
+    if (onlyTips && onlyTips.length > 0) {
+      groups = filterDownloadGroupsByTips(groups, onlyTips, { flatten });
+      log(`   只下载影视名称匹配的文件: ${onlyTips.join('、')}`);
+    }
     const rawCount = groups.reduce((n, g) => n + g.files.length, 0);
     if (rawCount === 0) {
       log(`   文件夹是空的，无需下载。`);
@@ -3210,6 +3331,111 @@ export function normalizeShareUrls(config) {
   return [];
 }
 
+// ---- 按「周几更新」调度 + 单分享同步/下载用的小工具 ----
+
+// 周几编号统一用 1=周一 … 7=周日（ISO 习惯），与中文「周一…周日」一一对应。
+// 不沿用 JS Date 的 0=周日：配置里写 0 时无法区分「周日」与「没填」，
+// 而「没填」本身有明确含义（每天同步）。
+export const WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+
+export function weekdayOf(date = new Date()) {
+  const d = date.getDay(); // 0=周日
+  return d === 0 ? 7 : d;
+}
+
+// 归一化 updateDays：只保留 1..7 的整数，去重并升序。
+// 手改配置写错值（0、8、"周一"、字符串）时静默丢弃而不是抛错：
+// 一个写错的天数不该让整轮同步失败；网页保存配置时另有严格校验。
+export function normalizeUpdateDays(value) {
+  if (!Array.isArray(value)) return [];
+  const out = new Set();
+  for (const v of value) {
+    if (Number.isInteger(v) && v >= 1 && v <= 7) out.add(v);
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+// 两次同步之间的最大间隔（小时）：按周循环算相邻两个「周几」的差，取最大。
+// 例如只填 [3] → 7 天；[1,4] → 3 天与 4 天，取 4 天。返回 0 表示没配周几。
+// 用途：周更分享只在某个星期同步时，时间窗口必须至少覆盖这个间隔，
+// 否则两次同步之间发布的文件会落在窗口外、永远转存不到。
+export function updateDaysMaxGapHours(days) {
+  const list = normalizeUpdateDays(days);
+  if (list.length === 0) return 0;
+  if (list.length === 1) return 7 * 24;
+  let maxGapDays = 0;
+  for (let i = 0; i < list.length; i++) {
+    const next = i + 1 < list.length ? list[i + 1] : list[0] + 7;
+    maxGapDays = Math.max(maxGapDays, next - list[i]);
+  }
+  return maxGapDays * 24;
+}
+
+// 该分享实际生效的时间窗口：配了「周几更新」时放宽到至少覆盖同步间隔。
+// 放宽后多列出的文件会被现有的「同一集已存在」去重拦住，不会重复转存。
+export function effectiveShareHours(hours, updateDays) {
+  const gap = updateDaysMaxGapHours(updateDays);
+  return gap > hours ? gap : hours;
+}
+
+// 今天要不要同步这个分享：没配周几 = 每天同步（向后兼容旧配置）。
+export function shareRunsOnDay(share, weekday) {
+  const days = normalizeUpdateDays(share && share.updateDays);
+  return days.length === 0 || days.includes(weekday);
+}
+
+// 按今天星期几切分分享列表，保留原数组下标（日志与「第 N 个分享」都靠它）。
+export function filterSharesForWeekday(shares, weekday) {
+  const active = [];
+  const skipped = [];
+  (shares || []).forEach((share, index) => {
+    (shareRunsOnDay(share, weekday) ? active : skipped).push({ share, index });
+  });
+  return { active, skipped };
+}
+
+// 分享的可读标签：优先影视名称，其次链接（截断），用于日志。
+function shareLabel(share) {
+  if (!share) return '（空）';
+  const tip = String(share.tip || '').trim();
+  if (tip) return tip;
+  const first = shareUrlsText(share).split('\n')[0] || '';
+  return first.length > 60 ? `${first.slice(0, 60)}…` : (first || '（无链接）');
+}
+
+// 周几配置的可读描述：用于日志（「周一、周四」），没配返回「每天」。
+function updateDaysLabel(days) {
+  const list = normalizeUpdateDays(days);
+  if (list.length === 0) return '每天';
+  return list.map(d => WEEKDAY_LABELS[d - 1]).join('、');
+}
+
+// 分享 url（字符串 / 数组 / 对象）归一成「一行一个链接」的文本，供网页比对
+// 「页面上的分享是否就是已保存的那一条」。
+export function shareUrlsText(share) {
+  if (share === undefined || share === null) return '';
+  if (typeof share === 'string') return share.trim();
+  const raw = Array.isArray(share) ? share : share.url;
+  const list = Array.isArray(raw) ? raw : (raw === undefined || raw === null ? [] : [raw]);
+  return list.map(u => String(u).trim()).filter(Boolean).join('\n');
+}
+
+// 单分享下载时只保留这些影视名称对应的文件：
+// - 平铺模式（flatten）下所有文件在同一组里，按「影视名称-」前缀筛；
+// - 分文件夹模式下「影视名称」文件夹整组保留，当层的旧平铺文件仍按前缀筛。
+// 夸克文件字段是 file_name，AList 是 name，默认 nameOf 两者都兼容。
+export function filterDownloadGroupsByTips(groups, tips, { flatten = false, nameOf = f => f.file_name || f.name } = {}) {
+  const list = (Array.isArray(tips) ? tips : []).map(t => String(t || '').trim()).filter(Boolean);
+  if (list.length === 0) return groups;
+  const prefixes = list.map(t => normalizePrefix(t)).filter(Boolean);
+  const folders = new Set(list.map(t => showFolderName(t)).filter(Boolean));
+  const keepFile = f => prefixes.some(p => String(nameOf(f) || '').startsWith(p));
+  return (groups || []).map(g => {
+    if (flatten || g.relDir === '') return { ...g, files: g.files.filter(keepFile) };
+    return folders.has(g.relDir) ? g : null;
+  }).filter(Boolean);
+}
+
 // 已注册的 cron 任务，供 web 层查询下次运行时间与手动触发
 const scheduledTasks = [];
 
@@ -3264,7 +3490,11 @@ export function registerScheduledTasks({ quiet = false } = {}) {
       key: `sync:${i}`,
       name: chained ? '同步 + AList下载' : '同步模式',
       cron: c,
-      fn: () => (chained ? runSyncThenDownload(loadConfig()) : runSync(loadConfig())),
+      // 定时任务按「周几更新」过滤：只同步今天该同步的分享（没配周几的照旧每天同步）。
+      // 网页/CLI 手动触发不传 dayFilter，保持全量检查，方便临时补查。
+      fn: () => (chained
+        ? runSyncThenDownload(loadConfig(), { dayFilter: true })
+        : runSync(loadConfig(), { dayFilter: true })),
     })),
     ...alistCrons.map((c, i) => ({ key: `alist:${i}`, name: 'AList下载', cron: c, fn: () => runAlist(loadConfig()) })),
   ];
@@ -3314,7 +3544,7 @@ export async function runAlist(config) {
   return withTaskLock('alist', () => alistInternal(config ?? loadConfig()));
 }
 
-async function alistInternal(config, { skipExisting = true } = {}) {
+async function alistInternal(config, { skipExisting = true, onlyTips = null } = {}) {
   const alistUrl = config.alistUrl;
   // alistMode(CLI) 自带校验，这里补上是为了让 cron、网页手动触发、启动补跑
   // 也都拿到可读提示，而不是 AlistClient 里 undefined.replace 的报错
@@ -4435,6 +4665,39 @@ function main() {
     process.exit(1);
   }
 
+  // 单分享：--share N（1 起，与网页「第 N 个分享」一致）；再加 --download 只下载该分享。
+  // 只支持同步模式，其它模式静默忽略会让人以为只处理了某个分享。
+  // 同时支持 --share N 与 --share=N 两种写法（后者常被顺手写出来）。
+  const shareEqArg = process.argv.find(a => a.startsWith('--share='));
+  const hasShareFlag = shareEqArg !== undefined || process.argv.includes('--share');
+  const shareArg = shareEqArg !== undefined
+    ? shareEqArg.slice('--share='.length)
+    : (process.argv.includes('--share') ? flagValue('--share') : '');
+  const wantDownload = process.argv.includes('--download');
+  let shareIndex = null;
+  if (hasShareFlag) {
+    if (!/^\d+$/.test(shareArg) || Number(shareArg) < 1) {
+      logError('错误: --share 需要从 1 开始的分享序号，例如: node src/index.js sync --share 2');
+      process.exit(1);
+    }
+    shareIndex = Number(shareArg) - 1;
+  }
+  if (shareIndex !== null) {
+    const shareUnsupported = [...nonSyncModes, '--dedupe', 'dedupe'];
+    if (shareUnsupported.includes(mode)) {
+      logError('错误: --share 只支持同步模式，例如: node src/index.js sync --share 2');
+      process.exit(1);
+    }
+  }
+  if (wantDownload && shareIndex === null) {
+    logError('错误: --download 只能和 --share 一起用，例如: node src/index.js sync --share 2 --download');
+    process.exit(1);
+  }
+  if (dryRun && wantDownload) {
+    logError('错误: --dry-run 不能和 --download 一起用（试运行不做任何写入，也不下载）');
+    process.exit(1);
+  }
+
   if (mode === '--dedupe' || mode === 'dedupe') {
     dedupeMode(applyDedupe, { cloud: !localOnly, local: !cloudOnly }).catch(err => {
       logError('\n程序异常: ' + err.message);
@@ -4467,8 +4730,16 @@ function main() {
         logError('\n程序异常: ' + err.message);
         process.exit(1);
       });
+  } else if (shareIndex !== null && wantDownload) {
+    log('=== 夸克网盘自动同步工具（单分享同步 + 下载） ===\n');
+    const config = loadConfigOrExit();
+    // --force-download / --no-skip 照常生效：忽略已下载记录，只重下该分享的文件
+    runShareSyncThenDownload(config, { shareIndex, download: true, forceDownload }).catch(err => {
+      logError('\n程序异常: ' + err.message);
+      process.exit(1);
+    });
   } else {
-    syncMode(dryRun).catch(err => {
+    syncMode(dryRun, shareIndex).catch(err => {
       logError('\n程序异常: ' + err.message);
       process.exit(1);
     });

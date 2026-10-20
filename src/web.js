@@ -12,6 +12,9 @@ import {
   logError,
   runSync,
   runSyncThenDownload,
+  runShareSyncThenDownload,
+  normalizeShareUrls,
+  shareUrlsText,
   runAlist,
   runDedupe,
   listScheduledTasks,
@@ -213,6 +216,15 @@ function validateConfig(c) {
         if (item.hours !== undefined && item.hours !== null && item.hours !== '' && !isValidDuration(item.hours)) {
           errors.push(`shareUrls[${i}].hours 需要是数字（按小时）或时长写法，如 6、12h、1d`);
         }
+        // updateDays：1=周一 … 7=周日，可多选；undefined/null/空数组都表示「每天同步」，
+        // 因此放行。运行时 normalizeUpdateDays 会丢弃非法值，但网页保存要尽早报错，
+        // 免得用户以为「勾上了」实际被静默忽略。
+        if (item.updateDays !== undefined && item.updateDays !== null) {
+          const days = item.updateDays;
+          if (!Array.isArray(days) || days.some(d => !isInt(d) || d < 1 || d > 7)) {
+            errors.push(`shareUrls[${i}].updateDays 必须是 1-7 的整数数组（1=周一，7=周日）`);
+          }
+        }
         for (const k of ['minFileSizeMB', 'maxFilesPerShare']) {
           if (item[k] !== undefined && !isInt(item[k])) errors.push(`shareUrls[${i}].${k} 必须是整数`);
         }
@@ -282,6 +294,14 @@ async function triggerTask(key) {
   if (k === 'dedupe') return runDedupe(undefined, { apply: false });
   if (k === 'dedupe-apply') return runDedupe(undefined, { apply: true });
   throw new Error(`未知任务: ${key}`);
+}
+
+// 单分享「同步 / 同步+下载」：只跑指定的那一个分享，下载也只下载该分享的文件。
+// 与 triggerTask 一样在后台执行、立即返回 202；前端轮询 /api/tasks 看运行状态。
+function triggerShareTask(cfg, index, download) {
+  runShareSyncThenDownload(cfg, { shareIndex: index, download })
+    .then(() => log(`网页任务 单分享${download ? '同步+下载' : '同步'} 执行完成`))
+    .catch(e => logError(`网页任务 单分享${download ? '同步+下载' : '同步'} 执行失败: ${e.message}`));
 }
 
 function createServer() {
@@ -522,6 +542,51 @@ function createServer() {
           .then(() => log(`网页任务 ${key} 执行完成`))
           .catch(e => logError(`网页任务 ${key} 执行失败: ${e.message}`));
         sendJson(res, 202, { ok: true, started: key });
+        return;
+      }
+
+      // ---- 单分享：同步 / 同步+下载 ----
+      // 页面按钮需要「这一行」而不是全量检查，所以单独一个接口；
+      // 下载来源与定时任务一致（配了 AList 走 AList，否则直连网盘）。
+      if (p === '/api/share/run' && req.method === 'POST') {
+        const raw = await readBody(req);
+        let body;
+        try {
+          body = JSON.parse(raw || '{}');
+        } catch {
+          sendJson(res, 400, { error: '请求格式错误' });
+          return;
+        }
+        const index = body.index;
+        if (!Number.isInteger(index) || index < 0) {
+          sendJson(res, 400, { error: 'index 必须是非负整数' });
+          return;
+        }
+        const cfg = loadConfig();
+        const shares = normalizeShareUrls(cfg);
+        // 页面可能停在旧配置上，越界就明确让用户刷新，避免同步错分享
+        if (index >= shares.length) {
+          sendJson(res, 400, { error: '分享不存在（配置已变化，请重新载入页面）' });
+          return;
+        }
+        // 「同步+下载」按已保存的配置执行：页面上的链接必须和配置里的那一项一致，
+        // 否则用户改了链接还没保存就点按钮，会同步到另一个分享上。
+        const urls = Array.isArray(body.urls) ? body.urls.map(s => String(s).trim()).filter(Boolean) : [];
+        if (shareUrlsText(shares[index]) !== urls.join('\n')) {
+          sendJson(res, 409, { error: '页面上的分享与已保存的配置不一致，请先保存或重新载入页面' });
+          return;
+        }
+        // 与 /api/run 共用同一把进程内互斥锁：同步/下载进行中不允许再插一个任务
+        if (isTaskRunning('sync') || isTaskRunning('alist')) {
+          sendJson(res, 409, { error: '已有任务正在运行中，请稍后再试' });
+          return;
+        }
+        const download = body.download !== false;
+        const share = shares[index] || {};
+        const tip = String(share.tip || cfg.tip || '').trim();
+        log(`网页手动触发${download ? '同步+下载' : '同步'}：第 ${index + 1} 个分享${tip ? `（${tip}）` : ''}`);
+        triggerShareTask(cfg, index, download);
+        sendJson(res, 202, { ok: true, started: 'share', index, download });
         return;
       }
 

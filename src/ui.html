@@ -74,7 +74,8 @@
   #panel-shares .tablewrap { flex: 1; min-height: 0; }
   #panel-shares .tablewrap + .actions,
   #panel-shares .tablewrap + .actions + .hint { flex: none; }
-  table.share-table { width: 100%; min-width: 860px; border-collapse: collapse; }
+  /* 9 列（多出「周几更新」与三个操作按钮）：窄窗口靠 .tablewrap 横向滚动，不挤压输入框 */
+  table.share-table { width: 100%; min-width: 1080px; border-collapse: collapse; }
   /* 表头吸顶。border-collapse: collapse 下 Chrome 滚动时可能丢底边，
      故用 box-shadow 画分隔线，避免表头与内容之间出现缝隙 */
   table.share-table th { font-size: 12px; color: #57606a; font-weight: 600; text-align: left;
@@ -93,7 +94,16 @@
   table.share-table .idx { color: #8b949e; font-size: 12px; white-space: nowrap; }
   table.share-table .idx .tag { display: inline-block; margin-left: 3px; padding: 0 4px;
                                 border-radius: 3px; background: #dbeafe; color: #1e40af; font-size: 10px; }
+  /* 周几更新：7 个勾选框挤在一格，所以 checkbox 要恢复原始尺寸
+     （上面 table.share-table input 的 28px 高度会把勾选框放成方块） */
+  table.share-table .wd-cell { white-space: nowrap; }
+  table.share-table .wd-cell label { display: inline-flex; align-items: center; gap: 1px;
+                                     margin-right: 3px; font-size: 12px; color: #57606a; }
+  table.share-table .wd-cell input { width: auto; height: auto; margin: 0; padding: 0; }
   table.share-table .col-act { text-align: right; white-space: nowrap; }
+  /* 操作列三个按钮要在一行放下：同步 / 同步+下载 / 删除，故比表格内其它按钮更紧凑 */
+  table.share-table .col-act button { padding: 4px 8px; }
+  table.share-table .col-act button + button { margin-left: 4px; }
   .share-empty { padding: 14px; text-align: center; color: #8b949e; font-size: 13px; }
   input[type=text], input[type=password], input[type=number], select, textarea {
     width: 100%; padding: 6px 9px; border: 1px solid #d0d7de; border-radius: 6px; font: inherit; background: #fff; }
@@ -175,7 +185,7 @@
     <div class="panel active" id="panel-shares">
       <div id="shareMsg" class="msg"></div>
       <div class="card">
-        <div class="card-hd"><h2>分享链接 <span class="hint" style="font-weight:400">（每项可单独覆盖多久内更新 / 最小体积 / 最多转存）</span></h2></div>
+        <div class="card-hd"><h2>分享链接 <span class="hint" style="font-weight:400">（每项可单独覆盖周几更新 / 多久内更新 / 最小体积 / 最多转存）</span></h2></div>
         <div class="card-bd">
           <div class="tablewrap">
             <table class="share-table">
@@ -185,10 +195,11 @@
                   <th style="width:110px">影视名称</th>
                   <th style="min-width:220px">链接</th>
                   <th style="width:82px">提取码</th>
+                  <th style="width:190px" title="只在这些星期跑定时任务，可多选；不勾 = 每天同步（手动触发不受限制）">周几更新</th>
                   <th style="width:88px" title="只转存「更新时间」在最近这段时间内的文件，如 24（小时）、12h、1d">多久内更新</th>
                   <th style="width:92px" title="小于这个体积（MB）的文件不转存，0 表示不过滤">最小体积 MB</th>
                   <th style="width:82px" title="按更新时间从新到旧，每个分享最多转存这么多个文件，0 表示不限制">最多转存</th>
-                  <th style="width:64px"></th>
+                  <th style="width:190px;text-align:right">操作</th>
                 </tr>
               </thead>
               <tbody id="shareBody"></tbody>
@@ -201,6 +212,10 @@
           </div>
           <div class="hint" style="margin-top:8px">
             链接格一行一个链接；写多行即为「备用链接组」，按顺序 failover（前一个失效才试下一个）。<br>
+            「周几更新」只影响<b>定时任务</b>：只同步勾选的星期；<b>不勾 = 每天同步</b>，可多选（1=周一 … 7=周日）。<br>
+            手动触发（网页「立即执行」/ CLI <code>sync</code>）仍是<b>全量检查</b>，不受周几限制，可用于临时补查。<br>
+            「同步+下载」按<b>已保存的配置</b>执行（页面未保存的修改不生效）；下载来源与定时任务一致：配置了 AList 用 AList，否则直接下载网盘文件。
+            只下载该分享的文件，因此需要填写影视名称（否则会提示跳过下载）。<br>
             多久内更新 / 最小体积 / 最多转存留空 = 沿用配置页里的全局设置；最小体积、最多转存填 0 = 显式覆盖为「不限制」（多久内更新填 0 则什么都转存不了）。<br>
             影视名称、提取码留空 = 不重命名、不填提取码（磁盘配置里若仍留有对应的全局字段，会作为回退生效）。
           </div>
@@ -562,13 +577,24 @@ function rowIsGroup(tr) {
   return el.value.split('\n').map(s => s.trim()).filter(Boolean).length > 1;
 }
 
+// 「周几更新」只认 1..7 的整数（与后端的 normalizeUpdateDays 一致）：手写配置里可能
+// 有越界值 / 字符串 / 重复项，回填时静默丢弃，避免勾选状态和保存结果对不上
+function normDays(v) {
+  if (!Array.isArray(v)) return [];
+  const set = new Set();
+  for (const x of v) if (Number.isInteger(x) && x >= 1 && x <= 7) set.add(x);
+  return [...set].sort((a, b) => a - b);
+}
+// 勾选框的紧凑文字，下标 0 对应周一
+const WD_LABELS = ['一', '二', '三', '四', '五', '六', '日'];
+
 function renderShares(list) {
   const body = $('shareBody');
   body.innerHTML = '';
   const rows = (list || []);
   if (rows.length === 0) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="8" class="share-empty">暂无分享链接，点击下方按钮添加</td>';
+    tr.innerHTML = '<td colspan="9" class="share-empty">暂无分享链接，点击下方按钮添加</td>';
     body.appendChild(tr);
     return;
   }
@@ -577,6 +603,7 @@ function renderShares(list) {
     const obj = isStr ? { url: item } : item;
     const urlIsArr = Array.isArray(obj.url);
     const urlText = urlIsArr ? obj.url.join('\n') : (obj.url || '');
+    const days = normDays(obj.updateDays);
 
     const tr = document.createElement('tr');
     tr.className = 'share-row';
@@ -586,11 +613,19 @@ function renderShares(list) {
       <td><textarea rows="${urlIsArr ? 3 : 1}" data-f="url"
             placeholder="https://pan.quark.cn/s/xxxxxx&#10;（换行填写多个即为备用链接组）">${esc(urlText)}</textarea></td>
       <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="如：1234"></td>
+      <td class="wd-cell">${WD_LABELS.map((lbl, i) =>
+        `<label title="周${lbl}"><input type="checkbox" data-day="${i + 1}"${days.includes(i + 1) ? ' checked' : ''}>${lbl}</label>`
+      ).join('')}</td>
       <td><input type="text" data-f="hours" value="${esc(obj.hours)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="minFileSizeMB" value="${esc(obj.minFileSizeMB)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="maxFilesPerShare" value="${esc(obj.maxFilesPerShare)}" placeholder="继承"></td>
-      <td class="col-act"><button class="danger" data-act="del">删除</button></td>
+      <td class="col-act">
+        <button data-act="sync">同步</button><button data-act="sync-dl">同步+下载</button><button class="danger" data-act="del">删除</button>
+      </td>
     `;
+    // 单分享触发：按当前 DOM 行序算 index（后端会再校验 url 是否与已保存配置一致）
+    tr.querySelector('[data-act=sync]').onclick = () => triggerShare(tr, false);
+    tr.querySelector('[data-act=sync-dl]').onclick = () => triggerShare(tr, true);
     tr.querySelector('[data-act=del]').onclick = () => {
       tr.remove();
       if ($('shareBody').querySelectorAll('tr.share-row').length === 0) renderShares([]);
@@ -598,12 +633,13 @@ function renderShares(list) {
     };
     // 输入时实时刷新「备用组」标记与文本框高度
     const urlEl = tr.querySelector('[data-f=url]');
-    // 失效链接被清理后 url 为空、但条目还在（影视名称 / 提取码 / 筛选条件都保留）：
+    // 失效链接被清理后 url 为空、但条目还在（影视名称 / 提取码 / 周几 / 筛选条件都保留）：
     // 给个专门的提示，免得看着像空行、被人以为该删
     const hasOther = obj.tip || obj.password || obj.hours !== undefined
-      || obj.minFileSizeMB !== undefined || obj.maxFilesPerShare !== undefined;
+      || obj.minFileSizeMB !== undefined || obj.maxFilesPerShare !== undefined
+      || (Array.isArray(obj.updateDays) && obj.updateDays.length > 0);
     if (urlText === '' && hasOther) {
-      urlEl.placeholder = '链接已被清空（原分享已失效），粘贴新链接即可；本行的影视名称与筛选条件会保留';
+      urlEl.placeholder = '链接已被清空（原分享已失效），粘贴新链接即可；本行的影视名称、周几与筛选条件会保留';
     }
     urlEl.addEventListener('input', () => {
       const n = urlEl.value.split('\n').filter(s => s.trim()).length;
@@ -617,14 +653,18 @@ function renderShares(list) {
   applyShareFilter();
 }
 
-// 刷新序号与「备用组」标记，并更新计数。
+// 刷新序号与「备用组」/「今天」标记，并更新计数。
 // 这里**不**重新决定可见性：在链接框里打字时若该行不再匹配筛选条件，
 // 行会突然消失并丢掉焦点，输入就断了。
 function renumber() {
+  // 今天周几：getDay() 里 0 是周日，而配置里的 7 才是周日
+  const today = new Date().getDay() || 7;
   $('shareBody').querySelectorAll('tr.share-row').forEach((tr, i) => {
     const isGroup = rowIsGroup(tr);
+    // 勾了今天的行会进今天的定时任务，标出来方便核对；「备用组」保持在前
+    const isToday = checkedDays(tr).includes(today);
     tr.querySelector('.idx').innerHTML =
-      `#${i + 1}${isGroup ? '<span class="tag">备用组</span>' : ''}`;
+      `#${i + 1}${isGroup ? '<span class="tag">备用组</span>' : ''}${isToday ? '<span class="tag">今天</span>' : ''}`;
   });
   updateShareCount();
 }
@@ -710,12 +750,68 @@ function collectShares() {
       const v = g(k);
       if (v !== undefined) o[k] = Number(v);
     }
+    // 周几更新：勾了什么就存什么（升序）；一个都没勾 = 不写该字段，表示每天同步。
+    // 不写字段而不是写 []，是为了让「未配置」保持向后兼容
+    const days = checkedDays(tr);
+    if (days.length > 0) o.updateDays = days;
     // 纯字符串形式（只有 url、无其它字段）保持字符串，兼容旧配置
     const keys = Object.keys(o);
     if (!asArr && keys.length === 1 && keys[0] === 'url') out.push(o.url);
     else out.push(o);
   });
   return out;
+}
+
+// 读取某行勾选的周几（1..7 升序）。
+// data-* 真实 DOM 从 dataset 读；测试桩可能只给 getAttribute，两种都兼容。
+// 注意：放在 collectShares 之后、卡片折叠函数之前 —— test/ui-shares.test.js 按
+// collectShares 与「一级卡片折叠」两个标记抽取代码，函数声明会提升，抽出去后仍能调到。
+function checkedDays(tr) {
+  const out = [];
+  const boxes = tr.querySelectorAll ? tr.querySelectorAll('[data-day]') : [];
+  Array.from(boxes || []).forEach(el => {
+    if (!el || !el.checked) return;
+    const raw = el.dataset && el.dataset.day !== undefined ? el.dataset.day
+      : (el.getAttribute ? el.getAttribute('data-day') : '');
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 1 && n <= 7 && !out.includes(n)) out.push(n);
+  });
+  return out.sort((a, b) => a - b);
+}
+
+// 单分享「同步 / 同步+下载」：只跑该行对应的那一个分享。
+// 后端要求 index + urls 与已保存的配置一致（防止页面未保存的编辑导致同步错分享），
+// 不一致会返回 409 并提示先保存。
+async function triggerShare(tr, withDownload) {
+  const rows = [...$('shareBody').querySelectorAll('tr.share-row')];
+  const index = rows.indexOf(tr);
+  const urlEl = tr.querySelector('[data-f=url]');
+  const urls = (urlEl ? urlEl.value : '').split('\n').map(s => s.trim()).filter(Boolean);
+  if (urls.length === 0) {
+    notify('请先填写分享链接（修改后需先「保存配置」）', false);
+    return;
+  }
+  // 防抖：请求在途时把该行的两个同步按钮都禁用，避免连点重复触发（后端只会回 409）
+  const btns = [...tr.querySelectorAll('[data-act=sync], [data-act=sync-dl]')];
+  btns.forEach(b => { b.disabled = true; });
+  try {
+    await api('POST', '/api/share/run', { index, urls, download: withDownload });
+    notify(`任务已启动：第 ${index + 1} 个分享${withDownload ? '同步+下载' : '同步'}，可在「任务」页查看状态`, true);
+    // 任务在后台跑，运行状态由 /api/tasks 轮询接管；稍后再刷一次，避免第一次刷新时任务还没登记
+    refreshTasks();
+    setTimeout(refreshTasks, 1200);
+  } catch (e) {
+    // 400/409 等错误直接显示在分享页，并恢复按钮让用户能重试
+    notify(e.message, false);
+    btns.forEach(b => { b.disabled = false; });
+  }
+}
+
+// 有任务在跑时禁用所有行的同步按钮（删除仍可点）：后端同一时间只允许一个任务，
+// 提前禁用比让用户点了再吃 409 更友好
+function setShareActionsDisabled(disabled) {
+  document.querySelectorAll('#shareBody tr.share-row [data-act=sync], #shareBody tr.share-row [data-act=sync-dl]')
+    .forEach(b => { b.disabled = disabled; });
 }
 
 // 一级卡片折叠：状态只存内存，不写入配置
@@ -783,6 +879,10 @@ async function loadConfig() {
 
 $('addShare').onclick = () => addShare();
 $('shareFilter').addEventListener('input', applyShareFilter);
+// 勾选 / 取消周几后立即重算「今天」标记（不必等保存或下一次输入）
+$('shareBody').addEventListener('change', e => {
+  if (e.target && e.target.matches && e.target.matches('[data-day]')) renumber();
+});
 $('reloadBtn').onclick = async () => {
   try { await loadConfig(); notify('已重新载入', true); }
   catch (e) { notify(e.message, false); }
@@ -934,6 +1034,8 @@ async function refreshTasks() {
     const d = await api('GET', '/api/tasks');
     const running = d.running || [];
     $('runningBadge').textContent = running.length ? '运行中: ' + running.join(', ') : '';
+    // 分享页的每行同步按钮跟随任务状态禁用 / 恢复（刷新后不会出现「看着能点、点了 409」）
+    setShareActionsDisabled(running.length > 0);
 
     const rows = $('taskRows');
     rows.innerHTML = '';
