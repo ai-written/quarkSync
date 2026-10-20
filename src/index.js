@@ -825,16 +825,24 @@ function hasUploadTag(fileName) {
   return stripUploadTags(base) !== base;
 }
 
-// 宽松分组用的「未知发布组/版本标记」：中文剧名里夹着的短大写/字母数字片段
-// （FR、GM、V3、EP194、DDDZZTWO…）不算剧名的一部分。
+// 宽松分组用的「未知发布组/版本标记」：中文剧名里夹着的短字母数字片段
+// （FR、GM、V3、EP194、DDDZZTWO、GyWEB…）不算剧名的一部分。
 // 只对含中文的名字生效：英文剧名（如 `CSI MIAMI-08`）里的大写词可能真的是剧名，
 // 不能像中文这样一概忽略；长度也限制在 2~8 个字符，避免把长英文标题吃掉。
-const LOOSE_GROUP_TAG = /(^|[-_.\s[\]()（）])([A-Z][A-Z0-9]{0,7})(?=$|[-_.\s[\]()（）])/g;
+// 判定：全大写/数字（FR、V3、EP194、DDDZZTWO），或混合大小写但含 ≥2 个大写字母（GyWEB、WebDL）。
+const LOOSE_GROUP_TAG = /(^|[-_.\s[\]()（）])([A-Za-z][A-Za-z0-9]{1,7})(?=$|[-_.\s[\]()（）])/g;
+
+function isLooseTagToken(token) {
+  const upper = (token.match(/[A-Z]/g) || []).length;
+  if (upper === 0) return false;
+  if (/^[A-Z0-9]+$/.test(token)) return true;
+  return upper >= 2;
+}
 
 export function stripLooseGroupTags(name) {
   const s = String(name ?? '');
   if (!/[\u3400-\u9fff]/.test(s)) return s;
-  return s.replace(LOOSE_GROUP_TAG, '$1');
+  return s.replace(LOOSE_GROUP_TAG, (m, pre, token) => (isLooseTagToken(token) ? pre : m));
 }
 
 // 尾部还挂着「副本序号」的名字，如 `吞噬星空-245_4K_1` 里的 `_1`。
@@ -1190,7 +1198,9 @@ function looseShowTags(name) {
   const re = new RegExp(LOOSE_GROUP_TAG.source, 'g');
   const out = [];
   let m;
-  while ((m = re.exec(s))) out.push(m[2].toLowerCase());
+  while ((m = re.exec(s))) {
+    if (isLooseTagToken(m[2])) out.push(m[2].toLowerCase());
+  }
   return out;
 }
 

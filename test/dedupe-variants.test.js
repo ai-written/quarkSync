@@ -245,6 +245,7 @@ test('未知发布组/版本标记：DDDZZTWO、FR、V3、GM、EP194 不算剧�
     ['大主宰-DDDZZTWO-43.mp4', '大主宰-43.mp4'],
     ['凡人修仙传-FR.EP194.V3.4K SDR+.AVC-GM.mp4', '凡人修仙传-194 4K.mp4'],
     ['凡人修仙传-194 4K SDR+.AVC-GM.mp4', '凡人修仙传-194 4K.mp4'],
+    ['大王饶命-S03E04 4K-GyWEB.mp4', '大王饶命-S03E04 4K.mp4'],
   ];
   for (const [a, b] of pairs) {
     assert.equal(getEpisodeGroup(a).loose, getEpisodeGroup(b).loose, `${a} 与 ${b} 应归为同一集`);
