@@ -239,3 +239,37 @@ test('防误删：不同剧 + 上传标签不会被合并（集数不同 / 剧�
   ]);
   assert.deepEqual(other.sets, []);
 });
+
+test('未知发布组/版本标记：DDDZZTWO、FR、V3、GM、EP194 不算剧名的一部分', () => {
+  const pairs = [
+    ['大主宰-DDDZZTWO-43.mp4', '大主宰-43.mp4'],
+    ['凡人修仙传-FR.EP194.V3.4K SDR+.AVC-GM.mp4', '凡人修仙传-194 4K.mp4'],
+    ['凡人修仙传-194 4K SDR+.AVC-GM.mp4', '凡人修仙传-194 4K.mp4'],
+  ];
+  for (const [a, b] of pairs) {
+    assert.equal(getEpisodeGroup(a).loose, getEpisodeGroup(b).loose, `${a} 与 ${b} 应归为同一集`);
+    const { sets, skipped } = findDuplicateSets([
+      { file_name: a, size: 100 },
+      { file_name: b, size: 200 },
+    ]);
+    assert.equal(skipped.length, 0, `${a} 与 ${b} 不应是「无法确认」`);
+    assert.equal(sets.length, 1, `${a} 与 ${b} 应判为重复`);
+    assert.equal(sets[0].evidence, '剧名带上传标签');
+  }
+});
+
+test('未知标记只在含中文的名字里忽略；英文剧名里的短大写片段仍算剧名', () => {
+  // 英文剧名不做「短大写片段」剥离：Show-A 与 Show 可能是两部剧
+  const { sets } = findDuplicateSets([
+    { file_name: 'Show-A-07.mkv', size: 100 },
+    { file_name: 'Show-07.mkv', size: 200 },
+  ]);
+  assert.deepEqual(sets, []);
+  // 画质标记差异仍归到「画质/编码标记不同」，不会被发布组证据抢先
+  const sdr = findDuplicateSets([
+    { file_name: 'FR.EP195.V2.4K SDR+.AVC-GM.mp4', size: 100 },
+    { file_name: 'FR.EP195.V2.4K.AVC-GM.mp4', size: 200 },
+  ]);
+  assert.equal(sdr.sets.length, 1);
+  assert.equal(sdr.sets[0].evidence, '画质/编码标记不同');
+});

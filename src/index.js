@@ -825,6 +825,18 @@ function hasUploadTag(fileName) {
   return stripUploadTags(base) !== base;
 }
 
+// 宽松分组用的「未知发布组/版本标记」：中文剧名里夹着的短大写/字母数字片段
+// （FR、GM、V3、EP194、DDDZZTWO…）不算剧名的一部分。
+// 只对含中文的名字生效：英文剧名（如 `CSI MIAMI-08`）里的大写词可能真的是剧名，
+// 不能像中文这样一概忽略；长度也限制在 2~8 个字符，避免把长英文标题吃掉。
+const LOOSE_GROUP_TAG = /(^|[-_.\s[\]()（）])([A-Z][A-Z0-9]{0,7})(?=$|[-_.\s[\]()（）])/g;
+
+export function stripLooseGroupTags(name) {
+  const s = String(name ?? '');
+  if (!/[\u3400-\u9fff]/.test(s)) return s;
+  return s.replace(LOOSE_GROUP_TAG, '$1');
+}
+
 // 尾部还挂着「副本序号」的名字，如 `吞噬星空-245_4K_1` 里的 `_1`。
 // 只认**紧跟在画质/编码标记之后**的 1~2 位尾部数字：
 // - 去掉它之后，前面还得有一个独立成词的集数（`…-245_4K` 里的 245）
@@ -951,6 +963,8 @@ export function getEpisodeKey(fileName) {
 function episodeShowLoose(fileName, episode) {
   let s = stripNumericSuffix(fileName).replace(/\.[^.]+$/, '');
   s = stripUploadTags(s);
+  // 中文剧名里的发布组/版本标记（FR、V3、DDDZZTWO、EP194 等）不参与剧名比对
+  s = stripLooseGroupTags(s);
   s = s.replace(
     /(^|[-_.\s[\]()（）])(hdr10\+?|hdr|dolby\s*vision|dolbyvision|sdr\+?|8k|4k|2160p|1080p|720p|480p|uhd|fhd|hd|sd|hevc|x265|x264|h264|avc|10bit|8bit|web-?dl|bluray|remux|aac|dts|60fps)(?=$|[-_.\s[\]()（）])/gi,
     '$1',
@@ -1165,6 +1179,30 @@ function hasNoiseVariantEvidence(names) {
   return names.every(n => norm(n) === first);
 }
 
+// 组内「剧名带发布组/版本标记」证据：中文剧名里多出来的短大写片段
+// （`大主宰-DDDZZTWO-43` 与 `大主宰-43`、`凡人修仙传-FR.EP194.V3…` 与 `凡人修仙传-194`）。
+// 只在标记集合确实不同、且去掉标记后剧名部分相同时才算证据 ——
+// `…4K SDR+` 与 `…4K` 两边标记集合相同（SDR/4K 都是画质词），留给「画质/编码标记不同」判。
+function looseShowTags(name) {
+  const base = stripNumericSuffix(name).replace(/\.[^.]+$/, '');
+  if (!/[\u3400-\u9fff]/.test(base)) return [];
+  const s = base.replace(EPISODE_NOISE, ' ');
+  const re = new RegExp(LOOSE_GROUP_TAG.source, 'g');
+  const out = [];
+  let m;
+  while ((m = re.exec(s))) out.push(m[2].toLowerCase());
+  return out;
+}
+
+function hasLooseTagEvidence(names) {
+  const sets = names.map(n => new Set(looseShowTags(n)));
+  const sig = s => [...s].sort().join(',');
+  if (sets.every(s => sig(s) === sig(sets[0]))) return false;
+  const showOf = n => episodeShowLoose(n, parseEpisodeInfo(n)?.episode);
+  const first = showOf(names[0]);
+  return names.every(n => showOf(n) === first);
+}
+
 function duplicateEvidence(group, nameOf) {
   const names = group.map(nameOf);
   if (names.some(n => stripNumericSuffix(n) !== n) || hasCopySuffixEvidence(group, nameOf)) return '有序号副本';
@@ -1172,6 +1210,7 @@ function duplicateEvidence(group, nameOf) {
   const notations = new Set(group.map(f => getEpisodeGroup(nameOf(f))?.notation));
   if (notations.size > 1) return '季集写法不同';
   if (names.some(hasUploadTag)) return '剧名带上传标签';
+  if (hasLooseTagEvidence(names)) return '剧名带上传标签';
   if (hasNoiseVariantEvidence(names)) return '画质/编码标记不同';
   return null;
 }
