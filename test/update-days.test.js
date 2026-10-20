@@ -14,6 +14,8 @@ import {
   shareRunsOnDay,
   filterSharesForWeekday,
   shareUrlsText,
+  shareDownloadTips,
+  planDayDownload,
   filterDownloadGroupsByTips,
   pruneDeadUrls,
 } from '../src/index.js';
@@ -154,6 +156,64 @@ test('filterDownloadGroupsByTips：tips 为空时原样返回（定时任务/全
   assert.equal(filterDownloadGroupsByTips(groups, []), groups);
   assert.equal(filterDownloadGroupsByTips(groups, undefined), groups);
   assert.equal(filterDownloadGroupsByTips(groups, null), groups);
+});
+
+// ---- 前缀包含：选中「遮天」不能把「遮天-外传」的文件也算进来 ----
+// 下载后删除云端时，这个误匹配会删掉别的分享的文件，所以调用方要传 knownTips。
+test('filterDownloadGroupsByTips：knownTips 最长前缀优先，前缀包含的另一部剧不会被误匹配', () => {
+  const groups = [{
+    relDir: '',
+    files: [
+      { file_name: '遮天-01.mp4' },
+      { file_name: '遮天-外传-01.mp4' },
+      { file_name: '斗破苍穹-01.mp4' },
+    ],
+  }];
+  const knownTips = ['遮天', '遮天-外传', '斗破苍穹'];
+  const out = filterDownloadGroupsByTips(groups, ['遮天'], { flatten: true, knownTips });
+  assert.deepEqual(out[0].files.map(f => f.file_name), ['遮天-01.mp4']);
+  // 不传 knownTips 时只有选中项参与匹配，「遮天-外传」也以「遮天-」开头 → 被误算成「遮天」
+  const naive = filterDownloadGroupsByTips(groups, ['遮天'], { flatten: true });
+  assert.deepEqual(naive[0].files.map(f => f.file_name), ['遮天-01.mp4', '遮天-外传-01.mp4']);
+});
+
+// ---- 定时「同步+下载」的下载范围决策 ----
+test('shareDownloadTips：取实际同步分享的影视名称（去重、trim），统计无法识别的分享数', () => {
+  const entries = [
+    { share: { tip: '遮天' } },
+    { share: { tip: ' 遮天 ' } },
+    { share: { tip: '斗破苍穹' } },
+    { share: {} },
+  ];
+  assert.deepEqual(shareDownloadTips({}, entries), { tips: ['遮天', '斗破苍穹'], withoutTip: 1 });
+  // 全局 tip 是回退值：分享自身没填时用它
+  assert.deepEqual(
+    shareDownloadTips({ tip: '全局前缀' }, [{ share: {} }]),
+    { tips: ['全局前缀'], withoutTip: 0 },
+  );
+  assert.deepEqual(shareDownloadTips({}, []), { tips: [], withoutTip: 0 });
+});
+
+test('planDayDownload：没做周几过滤时维持全量下载', () => {
+  assert.deepEqual(planDayDownload({}, null), { mode: 'full' });
+  assert.deepEqual(planDayDownload({}, { filtered: false, tips: [], withoutTip: 0 }), { mode: 'full' });
+});
+
+test('planDayDownload：只同步了部分分享时，下载只取这些分享', () => {
+  assert.deepEqual(
+    planDayDownload({}, { filtered: true, tips: ['遮天', '斗破'], withoutTip: 0 }),
+    { mode: 'filtered', tips: ['遮天', '斗破'] },
+  );
+});
+
+test('planDayDownload：有分享没填影视名称时无法安全过滤', () => {
+  const day = { filtered: true, tips: ['遮天'], withoutTip: 1 };
+  // 开了「下载后删除云端」：全量下载会把没安排今天的分享的文件也删掉，宁可跳过下载
+  assert.deepEqual(planDayDownload({ deleteAfterDownload: true }, day),
+    { mode: 'skip', reason: 'missing-tip-delete' });
+  // 没开删除：退化为全量下载（只会多下，不会误删）
+  assert.deepEqual(planDayDownload({ deleteAfterDownload: false }, day),
+    { mode: 'full', reason: 'missing-tip' });
 });
 
 // ---- 清理失效链接不能丢周几配置 ----

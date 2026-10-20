@@ -1709,14 +1709,18 @@ export class QuarkClient {
   async downloadAllFromFolder(pdirFid, saveDir, skipExisting = true, deleteAfter = false, { flatten = false, tips = [], keepFile = () => true, onlyTips = null } = {}) {
     log(`   列出目标文件夹中的文件...`);
     let groups = await this.collectDownloadGroups(pdirFid, { flatten });
-    // 单分享下载：只保留该分享影视名称对应的文件，其余分享的内容不碰
+    // 单分享/按天下载：只保留选中影视名称对应的文件，其余分享的内容不碰
     if (onlyTips && onlyTips.length > 0) {
-      groups = filterDownloadGroupsByTips(groups, onlyTips, { flatten });
+      groups = filterDownloadGroupsByTips(groups, onlyTips, { flatten, knownTips: tips });
       log(`   只下载影视名称匹配的文件: ${onlyTips.join('、')}`);
     }
     const rawCount = groups.reduce((n, g) => n + g.files.length, 0);
     if (rawCount === 0) {
-      log(`   目标文件夹是空的，无需下载。`);
+      // 区分「目录本来就没有文件」和「过滤后没有该分享的文件」：
+      // 后者多半是影视名称写错/该剧还没转存，提示目录为空会误导排查方向
+      log(onlyTips && onlyTips.length > 0
+        ? `   没有找到与「${onlyTips.join('、')}」匹配的文件，无需下载。`
+        : `   目标文件夹是空的，无需下载。`);
       return;
     }
     // 每组单独去重：分文件夹后不同剧的「08.mkv」不能被当成同一集
@@ -2418,6 +2422,8 @@ async function syncInternal(config, opts = {}) {
 
   // 本轮要处理的分享（保留配置里的原始下标，日志与「第 N 个分享」都用它）
   let shares = allShares.map((share, index) => ({ share, index }));
+  // 周几过滤后本轮实际同步的分享对应的下载范围（见 runSyncThenDownload）；没有过滤时为 null
+  let dayDownload = null;
   // 配置里没有「周几更新」这一层时，定时任务仍然每天全量同步；
   // 只有勾了周几的分享才会被过滤掉。手动的单分享/全量同步都不做这层过滤。
   const weekday = weekdayOf();
@@ -2435,12 +2441,26 @@ async function syncInternal(config, opts = {}) {
       log(`[周几] 今天（${WEEKDAY_LABELS[weekday - 1]}）没有需要同步的分享，`
         + `跳过同步（${allShares.length} 个分享都未安排在今天更新）`);
       return {
-        skippedByDay: true, weekday, processedShares: 0,
+        skippedByDay: true, weekday, processedShares: 0, dayDownload: null,
+        totalSuccess: 0, totalFailed: 0, allSuccess: [], allFailed: [],
+        deadPwdIds: [], prunedUrls: null,
+      };
+    }
+    // 失效链接清理后会留下 url 为空的占位条目（影视名称/周几仍保留）：排到今天也不能真同步，
+    // 不能因为「有安排」就去登录、跑完一圈才发现没有链接。
+    const runnable = active.filter(({ share }) => shareUrlsText(share) !== '');
+    if (runnable.length === 0) {
+      log(`[周几] 今天（${WEEKDAY_LABELS[weekday - 1]}）安排了 ${active.length} 个分享，`
+        + `但都没有可用链接（可能已被「自动清理失效链接」清空），跳过同步`);
+      return {
+        skippedByDay: true, weekday, processedShares: 0, dayDownload: null,
         totalSuccess: 0, totalFailed: 0, allSuccess: [], allFailed: [],
         deadPwdIds: [], prunedUrls: null,
       };
     }
     shares = active;
+    // 只同步了其中一部分分享时，后面的下载也只能取这些分享的文件
+    dayDownload = { filtered: active.length < allShares.length, ...shareDownloadTips(config, active) };
     const skippedText = skipped.slice(0, 10)
       .map(({ share }) => `${shareLabel(share)}（${updateDaysLabel(share.updateDays)}）`)
       .join('、') + (skipped.length > 10 ? '…' : '');
@@ -2526,7 +2546,9 @@ async function syncInternal(config, opts = {}) {
     const { share, index: shareNo0 } = shares[si];
     const shareNo = shareNo0 + 1;
     const { url, password, tip, hours: itemHours, minFileSizeMB: itemMinSizeMB, maxFilesPerShare: itemMaxFiles, updateDays } = share;
-    const shareTip = tip || config.tip;
+    // 影视名称统一 trim：下载侧（单分享过滤）也是 trim 后匹配的，
+    // 两边不一致时手写配置里带首尾空格的 tip 会「同步得到、下载认不出」
+    const shareTip = String(tip || config.tip || '').trim();
     // 每项分享也可单独覆盖时间窗口，同样支持单位写法
     let shareHours = hours;
     if (itemHours !== undefined && itemHours !== null && itemHours !== '') {
@@ -2816,7 +2838,7 @@ async function syncInternal(config, opts = {}) {
     logAlways(LOG_RULE);
     return {
       dryRun: true, wouldTransfer: dryRunWouldTransfer, skippedByDay: false,
-      processedShares: shares.length,
+      processedShares: shares.length, dayDownload,
       totalSuccess: 0, totalFailed: 0, allSuccess: [], allFailed: [],
       deadPwdIds: [...deadPwdIds], prunedUrls: null,
     };
@@ -2885,7 +2907,7 @@ async function syncInternal(config, opts = {}) {
   }
 
   return {
-    skippedByDay: false, processedShares: shares.length,
+    skippedByDay: false, processedShares: shares.length, dayDownload,
     totalSuccess, totalFailed, allSuccess, allFailed,
     deadPwdIds: [...deadPwdIds], prunedUrls,
   };
@@ -2925,6 +2947,31 @@ export async function runSyncThenDownload(config, opts = {}) {
       return syncResult;
     }
 
+    // 今天只同步了一部分分享时，下载也只能取这些分享的文件：
+    // 否则没安排今天的分享会被顺带下载（开启「下载后删除云端」时还会把它们的云端文件删掉）。
+    const plan = planDayDownload(cfg, syncResult.dayDownload);
+    if (plan.mode !== 'full') {
+      if (!cfg.alistUrl) {
+        logError('   ⚠ 已开启 downloadAfterSync 但未配置 alistUrl，跳过同步后的下载');
+        return syncResult;
+      }
+      if (plan.mode === 'skip') {
+        logError('   ⚠ 今天有分享未填写「影视名称」，无法只下载今天的分享；'
+          + '为避免「下载后删除云端」误删没安排今天的分享，已跳过本次下载');
+        return syncResult;
+      }
+      try {
+        await alistInternal(cfg, { onlyTips: plan.tips });
+      } catch (e) {
+        logError(`   ✗ 同步后的 AList 下载失败: ${e.message}`);
+      }
+      return syncResult;
+    }
+    if (plan.reason === 'missing-tip') {
+      logError('   ⚠ 今天有分享未填写「影视名称」，无法只下载今天的分享，改为全量下载'
+        + '（未开启「下载后删除云端」，不会误删）');
+    }
+
     if (!cfg.alistUrl) {
       logError('   ⚠ 已开启 downloadAfterSync 但未配置 alistUrl，跳过同步后的下载');
       return syncResult;
@@ -2960,10 +3007,11 @@ export async function runShareSyncThenDownload(config, { shareIndex, download = 
       return result;
     }
     try {
+      // 单分享操作不该顺带清理别的分享：skipCleanup 让下载步骤也不跑 cleanupAfterDays
       if (cfg.alistUrl) {
-        await alistInternal(cfg, { onlyTips: [tip], skipExisting: !forceDownload });
+        await alistInternal(cfg, { onlyTips: [tip], skipExisting: !forceDownload, skipCleanup: true });
       } else {
-        await quarkDownloadInternal(cfg, { onlyTips: [tip], forceDownload });
+        await quarkDownloadInternal(cfg, { onlyTips: [tip], forceDownload, skipCleanup: true });
       }
     } catch (e) {
       // 同步本身已经成功，下载失败不应让整个单分享任务算作失败
@@ -3003,10 +3051,11 @@ function migrateLocalBeforeDownload(config, saveDir) {
 }
 
 // 夸克网盘 → 本地的下载主体：CLI 的 download 模式与网页「同步+下载」共用。
-// onlyTips 非空时只下载这些影视名称对应的文件（单分享下载）。
+// onlyTips 非空时只下载这些影视名称对应的文件（单分享/按天下载）。
+// skipCleanup：跳过 cleanupAfterDays 的本地清理（单分享操作不该删别的分享的旧文件）。
 // 这里不拿跨进程锁、也不退出进程：CLI 由 downloadMode 包一层，
 // 网页侧由进程内任务锁保证互斥。
-async function quarkDownloadInternal(config, { forceDownload = false, onlyTips = null } = {}) {
+async function quarkDownloadInternal(config, { forceDownload = false, onlyTips = null, skipCleanup = false } = {}) {
   const client = new QuarkClient(config.cookie);
   const saveDir = path.resolve(config.downloadDir || '.');
   if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
@@ -3030,9 +3079,16 @@ async function quarkDownloadInternal(config, { forceDownload = false, onlyTips =
   const skipExisting = !forceDownload;
   migrateLocalBeforeDownload(config, saveDir);
   await client.downloadAllFromFolder(targetDirFid, saveDir, skipExisting, config.deleteAfterDownload,
-    { flatten: config.folderPerShow !== true, tips: config.folderPerShow === true ? configTips(config) : [], keepFile: name => shouldKeepFile(name, config), onlyTips });
+    {
+      flatten: config.folderPerShow !== true,
+      // 所有配置里的影视名称都传给过滤：单分享下载靠它识别「哪个前缀属于别的分享」，
+      // 避免「遮天」把「遮天外传」的文件也当成自己的（下载后删除时会误删）
+      tips: configTips(config),
+      keepFile: name => shouldKeepFile(name, config),
+      onlyTips,
+    });
 
-  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
+  if (!skipCleanup && config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`\n执行清理 (${config.cleanupAfterDays}天前的文件)...`);
     const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays, { folders: config.folderPerShow === true, folderNames: config.folderPerShow === true ? configShowFolders(config) : null });
     log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
@@ -3157,14 +3213,17 @@ class AlistClient {
   async downloadDir(alistPath, saveDir, skipExisting = true, deleteAfter = false, { flatten = false, tips = [], keepFile = () => true, onlyTips = null } = {}) {
     log(`   列出文件夹: ${alistPath} ...`);
     let groups = await this.collectDownloadGroups(alistPath, { flatten });
-    // 单分享下载：只保留该分享影视名称对应的文件，其余分享的内容不碰
+    // 单分享/按天下载：只保留选中影视名称对应的文件，其余分享的内容不碰
     if (onlyTips && onlyTips.length > 0) {
-      groups = filterDownloadGroupsByTips(groups, onlyTips, { flatten });
+      groups = filterDownloadGroupsByTips(groups, onlyTips, { flatten, knownTips: tips });
       log(`   只下载影视名称匹配的文件: ${onlyTips.join('、')}`);
     }
     const rawCount = groups.reduce((n, g) => n + g.files.length, 0);
     if (rawCount === 0) {
-      log(`   文件夹是空的，无需下载。`);
+      // 区分「目录本来就没有文件」和「过滤后没有该分享的文件」
+      log(onlyTips && onlyTips.length > 0
+        ? `   没有找到与「${onlyTips.join('、')}」匹配的文件，无需下载。`
+        : `   文件夹是空的，无需下载。`);
       return;
     }
     let dedupedCount = 0;
@@ -3384,6 +3443,38 @@ export function shareRunsOnDay(share, weekday) {
   return days.length === 0 || days.includes(weekday);
 }
 
+// 把一组分享映射成「单分享/按天下载」用的影视名称列表。
+// 定时同步+下载只把当天实际同步的分享交给下载，避免顺带下载（甚至删除）其它分享的文件。
+// tips 去重、trim；withoutTip 是「没有影视名称、无法用前缀识别」的分享数，调用方据此决定是否安全过滤。
+export function shareDownloadTips(config, entries) {
+  const tips = [];
+  let withoutTip = 0;
+  for (const entry of entries || []) {
+    const share = entry && entry.share ? entry.share : entry;
+    const tip = String((share && share.tip) || (config && config.tip) || '').trim();
+    if (tip) tips.push(tip);
+    else withoutTip++;
+  }
+  return { tips: [...new Set(tips)], withoutTip };
+}
+
+// 定时「同步+下载」在部分分享被周几过滤掉时，决定这次下载的范围：
+// - full：不做过滤（没有周几过滤，或无法识别但有风险时退化为全量）
+// - filtered：只下载当天同步的分享（tips）
+// - skip：无法安全过滤（有分享没填影视名称）且开了「下载后删除云端」→ 不下载，避免误删别的分享
+// 抽成纯函数既让主流程好读，也方便测试这些分支。
+export function planDayDownload(config, dayDownload) {
+  if (!dayDownload || !dayDownload.filtered) return { mode: 'full' };
+  if (dayDownload.withoutTip > 0) {
+    return config && config.deleteAfterDownload === true
+      ? { mode: 'skip', reason: 'missing-tip-delete' }
+      : { mode: 'full', reason: 'missing-tip' };
+  }
+  return dayDownload.tips.length > 0
+    ? { mode: 'filtered', tips: dayDownload.tips }
+    : { mode: 'full' };
+}
+
 // 按今天星期几切分分享列表，保留原数组下标（日志与「第 N 个分享」都靠它）。
 export function filterSharesForWeekday(shares, weekday) {
   const active = [];
@@ -3424,12 +3515,23 @@ export function shareUrlsText(share) {
 // - 平铺模式（flatten）下所有文件在同一组里，按「影视名称-」前缀筛；
 // - 分文件夹模式下「影视名称」文件夹整组保留，当层的旧平铺文件仍按前缀筛。
 // 夸克文件字段是 file_name，AList 是 name，默认 nameOf 两者都兼容。
-export function filterDownloadGroupsByTips(groups, tips, { flatten = false, nameOf = f => f.file_name || f.name } = {}) {
+// knownTips 传「配置里所有分享的影视名称」，用于处理前缀包含的误匹配：
+// 选中「遮天」时「遮天外传-01.mp4」也以「遮天-」开头，按最长前缀判定它属于「遮天外传」，
+// 不会被当成「遮天」的文件（开启「下载后删除云端」时，误匹配会删掉别的分享的文件）。
+export function filterDownloadGroupsByTips(groups, tips, { flatten = false, nameOf = f => f.file_name || f.name, knownTips = null } = {}) {
   const list = (Array.isArray(tips) ? tips : []).map(t => String(t || '').trim()).filter(Boolean);
   if (list.length === 0) return groups;
-  const prefixes = list.map(t => normalizePrefix(t)).filter(Boolean);
+  const selectedPrefixes = [...new Set(list.map(t => normalizePrefix(t)).filter(Boolean))];
+  const knownPrefixes = (Array.isArray(knownTips) ? knownTips : [])
+    .map(t => normalizePrefix(String(t || '').trim())).filter(Boolean);
+  // 最长优先：两个影视名称互为前缀时归到更具体的那个
+  const allPrefixes = [...new Set([...selectedPrefixes, ...knownPrefixes])].sort((a, b) => b.length - a.length);
   const folders = new Set(list.map(t => showFolderName(t)).filter(Boolean));
-  const keepFile = f => prefixes.some(p => String(nameOf(f) || '').startsWith(p));
+  const keepFile = f => {
+    const name = String(nameOf(f) || '');
+    const hit = allPrefixes.find(p => name.startsWith(p));
+    return hit !== undefined && selectedPrefixes.includes(hit);
+  };
   return (groups || []).map(g => {
     if (flatten || g.relDir === '') return { ...g, files: g.files.filter(keepFile) };
     return folders.has(g.relDir) ? g : null;
@@ -3544,7 +3646,7 @@ export async function runAlist(config) {
   return withTaskLock('alist', () => alistInternal(config ?? loadConfig()));
 }
 
-async function alistInternal(config, { skipExisting = true, onlyTips = null } = {}) {
+async function alistInternal(config, { skipExisting = true, onlyTips = null, skipCleanup = false } = {}) {
   const alistUrl = config.alistUrl;
   // alistMode(CLI) 自带校验，这里补上是为了让 cron、网页手动触发、启动补跑
   // 也都拿到可读提示，而不是 AlistClient 里 undefined.replace 的报错
@@ -3563,10 +3665,17 @@ async function alistInternal(config, { skipExisting = true, onlyTips = null } = 
   const client = new AlistClient(alistUrl, config.alistToken, config.alistRefresh);
   migrateLocalBeforeDownload(config, saveDir);
   await client.downloadDir(alistPath, saveDir, skipExisting, config.deleteAfterDownload,
-    { flatten: config.folderPerShow !== true, tips: config.folderPerShow === true ? configTips(config) : [], keepFile: name => shouldKeepFile(name, config) });
+    {
+      flatten: config.folderPerShow !== true,
+      // 所有配置里的影视名称都传给过滤：单分享/按天下载靠它识别「哪个前缀属于别的分享」，
+      // 避免「遮天」把「遮天外传」的文件也当成自己的（下载后删除时会误删）
+      tips: configTips(config),
+      keepFile: name => shouldKeepFile(name, config),
+      onlyTips,
+    });
   log(`   AList下载完成`);
 
-  if (config.cleanupAfterDays && config.cleanupAfterDays > 0) {
+  if (!skipCleanup && config.cleanupAfterDays && config.cleanupAfterDays > 0) {
     log(`   执行本地清理 (${config.cleanupAfterDays}天前的文件)...`);
     const localResult = cleanupLocalFiles(saveDir, config.cleanupAfterDays, { folders: config.folderPerShow === true, folderNames: config.folderPerShow === true ? configShowFolders(config) : null });
     log(`   本地: 删除 ${localResult.deleted} 个，保留 ${localResult.skipped} 个\n`);
@@ -4673,7 +4782,9 @@ function main() {
   const shareArg = shareEqArg !== undefined
     ? shareEqArg.slice('--share='.length)
     : (process.argv.includes('--share') ? flagValue('--share') : '');
-  const wantDownload = process.argv.includes('--download');
+  // `--download` 既是旧模式名（node src/index.js --download）又是新 flag（配合 --share），
+  // 当它作为模式出现时不能当成 flag，否则旧别名会在下面被误判成「缺 --share」直接退出
+  const wantDownload = mode !== '--download' && process.argv.includes('--download');
   let shareIndex = null;
   if (hasShareFlag) {
     if (!/^\d+$/.test(shareArg) || Number(shareArg) < 1) {
@@ -4733,6 +4844,12 @@ function main() {
   } else if (shareIndex !== null && wantDownload) {
     log('=== 夸克网盘自动同步工具（单分享同步 + 下载） ===\n');
     const config = loadConfigOrExit();
+    // 单分享下载也要拿跨进程锁：否则并发的 CLI download / alist 会同时写 downloadDir 与
+    // .downloaded.json，可能重复下载、互相覆盖记录（deleteAfterDownload 下还会重复删除）。
+    // 不传入会 process.exit 的 acquireLock 到 web 侧，网页路径仍由进程内任务锁互斥。
+    const saveDir = path.resolve(config.downloadDir || '.');
+    if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+    acquireLock(config.alistUrl ? '.alist.lock' : '.download.lock', saveDir);
     // --force-download / --no-skip 照常生效：忽略已下载记录，只重下该分享的文件
     runShareSyncThenDownload(config, { shareIndex, download: true, forceDownload }).catch(err => {
       logError('\n程序异常: ' + err.message);

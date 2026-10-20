@@ -522,6 +522,12 @@ function createServer() {
           sendJson(res, 400, { error: '请求格式错误' });
           return;
         }
+        // JSON.parse('null') 会得到 null：直接读 body.key 会抛异常变成 500，
+        // 这里显式按 400 处理，错误码才和「请求格式错误」一致
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          sendJson(res, 400, { error: '请求格式错误' });
+          return;
+        }
         const key = String(body.key || '');
         if (!key) {
           sendJson(res, 400, { error: '缺少任务名' });
@@ -557,6 +563,10 @@ function createServer() {
           sendJson(res, 400, { error: '请求格式错误' });
           return;
         }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          sendJson(res, 400, { error: '请求格式错误' });
+          return;
+        }
         const index = body.index;
         if (!Number.isInteger(index) || index < 0) {
           sendJson(res, 400, { error: 'index 必须是非负整数' });
@@ -572,7 +582,12 @@ function createServer() {
         // 「同步+下载」按已保存的配置执行：页面上的链接必须和配置里的那一项一致，
         // 否则用户改了链接还没保存就点按钮，会同步到另一个分享上。
         const urls = Array.isArray(body.urls) ? body.urls.map(s => String(s).trim()).filter(Boolean) : [];
-        if (shareUrlsText(shares[index]) !== urls.join('\n')) {
+        // 光比 URL 还不够：配置里可能有两行用同一个链接（影视名称/筛选条件不同），
+        // 页面删掉前一行后 index 左移，URL 仍能对上被删那一行 —— 再比一次影视名称，
+        // 两者都一致才认为页面这一行就是配置里的那一条。
+        const expectedTip = String((shares[index] && shares[index].tip) || '').trim();
+        const sentTip = typeof body.tip === 'string' ? body.tip.trim() : '';
+        if (shareUrlsText(shares[index]) !== urls.join('\n') || expectedTip !== sentTip) {
           sendJson(res, 409, { error: '页面上的分享与已保存的配置不一致，请先保存或重新载入页面' });
           return;
         }

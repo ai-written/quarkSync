@@ -780,13 +780,17 @@ function checkedDays(tr) {
 }
 
 // 单分享「同步 / 同步+下载」：只跑该行对应的那一个分享。
-// 后端要求 index + urls 与已保存的配置一致（防止页面未保存的编辑导致同步错分享），
+// 后端要求 index + 链接 + 影视名称与已保存的配置一致（防止页面未保存的编辑导致同步错分享），
 // 不一致会返回 409 并提示先保存。
 async function triggerShare(tr, withDownload) {
   const rows = [...$('shareBody').querySelectorAll('tr.share-row')];
   const index = rows.indexOf(tr);
   const urlEl = tr.querySelector('[data-f=url]');
   const urls = (urlEl ? urlEl.value : '').split('\n').map(s => s.trim()).filter(Boolean);
+  // 影视名称也带上：配置里可能有两行用同一个链接（名称/筛选不同），
+  // 后端同时比对链接与名称，避免页面删行后 index 左移同步错分享
+  const tipEl = tr.querySelector('[data-f=tip]');
+  const tip = (tipEl ? tipEl.value : '').trim();
   if (urls.length === 0) {
     notify('请先填写分享链接（修改后需先「保存配置」）', false);
     return;
@@ -795,7 +799,7 @@ async function triggerShare(tr, withDownload) {
   const btns = [...tr.querySelectorAll('[data-act=sync], [data-act=sync-dl]')];
   btns.forEach(b => { b.disabled = true; });
   try {
-    await api('POST', '/api/share/run', { index, urls, download: withDownload });
+    await api('POST', '/api/share/run', { index, urls, tip, download: withDownload });
     notify(`任务已启动：第 ${index + 1} 个分享${withDownload ? '同步+下载' : '同步'}，可在「任务」页查看状态`, true);
     // 任务在后台跑，运行状态由 /api/tasks 轮询接管；稍后再刷一次，避免第一次刷新时任务还没登记
     refreshTasks();
