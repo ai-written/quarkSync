@@ -100,6 +100,35 @@ test('清理后剩空链接的行：影视名称与周几配置都保留', () =>
   assert.deepEqual(saved, [{ url: '', tip: '大夏守墓人', updateDays: [7] }]);
 });
 
+// ---- 周几下拉按钮的摘要文字（改成多选下拉后，单元格里只显示摘要） ----
+function loadWdSummary() {
+  const start = html.indexOf('function wdSummary(');
+  // 到下一个辅助函数前的注释为止；不按 `}` 切是因为文件可能是 CRLF 行尾
+  const end = html.indexOf('// 周几下拉：收起', start);
+  assert.ok(start >= 0 && end > start, 'ui.html 里找不到 wdSummary()（标记变了就同步改这个测试）');
+  const src = html.slice(start, end);
+  // 摘要依赖 normDays 与 WD_LABELS（周几短名）：用等价实现注入，只验证格式化规则
+  const normDays = v => {
+    if (!Array.isArray(v)) return [];
+    const set = new Set();
+    for (const x of v) if (Number.isInteger(x) && x >= 1 && x <= 7) set.add(x);
+    return [...set].sort((a, b) => a - b);
+  };
+  const WD_LABELS = ['一', '二', '三', '四', '五', '六', '日'];
+  return new Function('normDays', 'WD_LABELS', `${src}\nreturn wdSummary;`)(normDays, WD_LABELS);
+}
+
+test('wdSummary：多选下拉按钮的摘要足够短（不选/全选=每天，3 天以上显示 N 天）', () => {
+  const summary = loadWdSummary();
+  assert.equal(summary([]), '每天');
+  assert.equal(summary(undefined), '每天');
+  assert.equal(summary([7]), '周日');
+  assert.equal(summary([4, 1]), '周一、周四');
+  assert.equal(summary([1, 2, 3]), '3 天');
+  assert.equal(summary([1, 2, 3, 4, 5]), '5 天');
+  assert.equal(summary([1, 2, 3, 4, 5, 6, 7]), '每天');
+});
+
 test('周几与原有筛选字段可以同时存在，互不影响', () => {
   const saved = saveable([makeRow({
     url: 'https://pan.quark.cn/s/aaa',

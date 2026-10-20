@@ -22,8 +22,9 @@
   header button { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.4); }
   /* 布局：header 与 tabs 固定，只有当前 tab 的面板滚动 */
   #app { height: 100vh; flex-direction: column; }
+  /* 宽屏时让表格真正用满窗口（原先 1080px 上限导致表格内部横向滚动条） */
   .wrap { flex: 1; min-height: 0; display: flex; flex-direction: column;
-          width: 100%; max-width: 1080px; margin: 0 auto; padding: 20px 20px 0; }
+          width: 100%; max-width: 1440px; margin: 0 auto; padding: 20px 20px 0; }
   .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #d0d7de; flex: none; }
   .tabs button { background: none; border: none; padding: 9px 16px; cursor: pointer; color: #57606a;
                  border-bottom: 2px solid transparent; font-size: 14px; }
@@ -74,8 +75,9 @@
   #panel-shares .tablewrap { flex: 1; min-height: 0; }
   #panel-shares .tablewrap + .actions,
   #panel-shares .tablewrap + .actions + .hint { flex: none; }
-  /* 9 列（多出「周几更新」与三个操作按钮）：窄窗口靠 .tablewrap 横向滚动，不挤压输入框 */
-  table.share-table { width: 100%; min-width: 1080px; border-collapse: collapse; }
+  /* 9 列：链接列吃掉剩余宽度（table-layout: fixed + 其余列定宽），
+     最小宽度只保证窄窗口下还能横向滚动，正常宽屏下表格铺满卡片、不出现横向滚动条 */
+  table.share-table { width: 100%; min-width: 980px; table-layout: fixed; border-collapse: collapse; }
   /* 表头吸顶。border-collapse: collapse 下 Chrome 滚动时可能丢底边，
      故用 box-shadow 画分隔线，避免表头与内容之间出现缝隙 */
   table.share-table th { font-size: 12px; color: #57606a; font-weight: 600; text-align: left;
@@ -94,15 +96,32 @@
   table.share-table .idx { color: #8b949e; font-size: 12px; white-space: nowrap; }
   table.share-table .idx .tag { display: inline-block; margin-left: 3px; padding: 0 4px;
                                 border-radius: 3px; background: #dbeafe; color: #1e40af; font-size: 10px; }
-  /* 周几更新：7 个勾选框挤在一格，所以 checkbox 要恢复原始尺寸
-     （上面 table.share-table input 的 28px 高度会把勾选框放成方块） */
+  /* 周几更新：单元格里只放一个「多选下拉」按钮，点开才显示 7 个勾选项。
+     以前 7 个常驻勾选框把这一列撑到 190px，是表格横向滚动的主因。 */
   table.share-table .wd-cell { white-space: nowrap; }
-  table.share-table .wd-cell label { display: inline-flex; align-items: center; gap: 1px;
-                                     margin-right: 3px; font-size: 12px; color: #57606a; }
-  table.share-table .wd-cell input { width: auto; height: auto; margin: 0; padding: 0; }
+  table.share-table .wd-btn { display: flex; align-items: center; justify-content: space-between;
+                              gap: 4px; width: 100%; height: 28px; padding: 4px 7px;
+                              font-size: 12px; color: #1f2328; text-align: left; background: #fff; }
+  table.share-table .wd-btn .sum { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  table.share-table .wd-btn .caret { color: #8b949e; font-size: 10px; flex: none; }
+  table.share-table .wd-btn.empty .sum { color: #8b949e; }
+  /* 下拉面板：position: fixed 才不会被 .tablewrap 的 overflow 裁掉；
+     打开时由 JS 按按钮位置定位，滚轮/缩放/点外面都会自动收起 */
+  table.share-table .wd-pop { position: fixed; z-index: 1000; background: #fff;
+                              border: 1px solid #d0d7de; border-radius: 6px; padding: 8px;
+                              min-width: 132px; box-shadow: 0 8px 24px rgba(31,35,40,.16); }
+  table.share-table .wd-pop[hidden] { display: none; }
+  table.share-table .wd-pop label { display: flex; align-items: center; gap: 7px; padding: 4px 6px;
+                                    border-radius: 4px; font-size: 13px; color: #1f2328;
+                                    white-space: nowrap; cursor: pointer; }
+  table.share-table .wd-pop label:hover { background: #f3f6fa; }
+  table.share-table .wd-pop input[type=checkbox] { width: auto; height: auto; margin: 0; padding: 0; }
+  table.share-table .wd-pop .wd-ft { border-top: 1px solid #eef0f2; margin-top: 6px; padding-top: 6px;
+                                     display: flex; justify-content: flex-end; }
+  table.share-table .wd-pop .wd-ft button { height: auto; padding: 2px 8px; font-size: 12px; }
   table.share-table .col-act { text-align: right; white-space: nowrap; }
   /* 操作列三个按钮要在一行放下：同步 / 同步+下载 / 删除，故比表格内其它按钮更紧凑 */
-  table.share-table .col-act button { padding: 4px 8px; }
+  table.share-table .col-act button { padding: 4px 6px; }
   table.share-table .col-act button + button { margin-left: 4px; }
   .share-empty { padding: 14px; text-align: center; color: #8b949e; font-size: 13px; }
   input[type=text], input[type=password], input[type=number], select, textarea {
@@ -191,15 +210,15 @@
             <table class="share-table">
               <thead>
                 <tr>
-                  <th style="width:44px">#</th>
-                  <th style="width:110px">影视名称</th>
-                  <th style="min-width:220px">链接</th>
-                  <th style="width:82px">提取码</th>
-                  <th style="width:190px" title="只在这些星期跑定时任务，可多选；不勾 = 每天同步（手动触发不受限制）">周几更新</th>
-                  <th style="width:88px" title="只转存「更新时间」在最近这段时间内的文件，如 24（小时）、12h、1d">多久内更新</th>
-                  <th style="width:92px" title="小于这个体积（MB）的文件不转存，0 表示不过滤">最小体积 MB</th>
-                  <th style="width:82px" title="按更新时间从新到旧，每个分享最多转存这么多个文件，0 表示不限制">最多转存</th>
-                  <th style="width:190px;text-align:right">操作</th>
+                  <th style="width:76px">#</th>
+                  <th style="width:108px">影视名称</th>
+                  <th>链接</th>
+                  <th style="width:78px">提取码</th>
+                  <th style="width:118px" title="点开多选：只在这些星期跑定时任务；不选 = 每天同步（手动触发不受限制）">周几更新</th>
+                  <th style="width:84px" title="只转存「更新时间」在最近这段时间内的文件，如 24（小时）、12h、1d">多久内更新</th>
+                  <th style="width:90px" title="小于这个体积（MB）的文件不转存，0 表示不过滤">最小体积 MB</th>
+                  <th style="width:78px" title="按更新时间从新到旧，每个分享最多转存这么多个文件，0 表示不限制">最多转存</th>
+                  <th style="width:176px;text-align:right">操作</th>
                 </tr>
               </thead>
               <tbody id="shareBody"></tbody>
@@ -212,7 +231,7 @@
           </div>
           <div class="hint" style="margin-top:8px">
             链接格一行一个链接；写多行即为「备用链接组」，按顺序 failover（前一个失效才试下一个）。<br>
-            「周几更新」只影响<b>定时任务</b>：只同步勾选的星期；<b>不勾 = 每天同步</b>，可多选（1=周一 … 7=周日）。<br>
+            「周几更新」点开是<b>多选下拉</b>，只影响<b>定时任务</b>：只同步选中的星期；<b>不选 = 每天同步</b>（1=周一 … 7=周日）。<br>
             手动触发（网页「立即执行」/ CLI <code>sync</code>）仍是<b>全量检查</b>，不受周几限制，可用于临时补查。<br>
             「同步+下载」按<b>已保存的配置</b>执行（页面未保存的修改不生效）；下载来源与定时任务一致：配置了 AList 用 AList，否则直接下载网盘文件。
             只下载该分享的文件，因此需要填写影视名称（否则会提示跳过下载）。<br>
@@ -525,6 +544,7 @@ $('loginBtn').onclick = async () => {
 $('token').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginBtn').click(); });
 
 $('logoutBtn').onclick = async () => {
+  closeWdPops();
   await fetch('/api/logout', { method: 'POST' });
   showLogin();
 };
@@ -532,6 +552,8 @@ $('logoutBtn').onclick = async () => {
 // ---------- 标签页 ----------
 document.querySelectorAll('.tabs button').forEach(b => {
   b.onclick = () => {
+    // 周几下拉是 position: fixed 的，切走页签时必须手动收起，否则会悬在新页面上
+    closeWdPops();
     document.querySelectorAll('.tabs button').forEach(x => x.classList.remove('active'));
     document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
@@ -588,6 +610,60 @@ function normDays(v) {
 // 勾选框的紧凑文字，下标 0 对应周一
 const WD_LABELS = ['一', '二', '三', '四', '五', '六', '日'];
 
+// 下拉按钮上显示的文字：不选=每天；全选也等价于每天；选 3 天以上只显示「N 天」，
+// 避免摘要本身又把这一列撑长（具体日期在按钮 title 与下拉里都能看到）
+function wdSummary(days) {
+  const list = normDays(days);
+  if (list.length === 0 || list.length === 7) return '每天';
+  if (list.length > 2) return `${list.length} 天`;
+  return list.map(d => `周${WD_LABELS[d - 1]}`).join('、');
+}
+
+// 周几下拉：收起 / 定位 / 开关 / 刷新摘要。
+// 面板用 position: fixed（见 CSS 注释），否则会被 .tablewrap 的 overflow 裁掉；
+// 定位按按钮位置算，下方空间不够就向上翻。
+function closeWdPops(except) {
+  document.querySelectorAll('#shareBody .wd-pop:not([hidden])').forEach(p => {
+    if (!except || p !== except) p.hidden = true;
+  });
+}
+
+function positionWdPop(tr) {
+  const btn = tr.querySelector('.wd-btn');
+  const pop = tr.querySelector('.wd-pop');
+  if (!btn || !pop) return;
+  const r = btn.getBoundingClientRect();
+  pop.hidden = false;
+  const w = pop.offsetWidth;
+  const h = pop.offsetHeight;
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+  let top = r.bottom + 4;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 4);
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function toggleWdPop(tr) {
+  const pop = tr.querySelector('.wd-pop');
+  if (!pop) return;
+  const willOpen = pop.hidden;
+  closeWdPops();
+  if (willOpen) positionWdPop(tr);
+}
+
+// 勾选变化后即时更新按钮摘要与「今天」标记（不必等保存或重新渲染）
+function updateWdSummary(tr) {
+  const btn = tr.querySelector('.wd-btn');
+  if (!btn) return;
+  const days = checkedDays(tr);
+  const sum = btn.querySelector('.sum');
+  if (sum) sum.textContent = wdSummary(days);
+  btn.classList.toggle('empty', days.length === 0);
+  btn.title = days.length
+    ? `每周${days.map(d => WD_LABELS[d - 1]).join('、')}更新（点击修改）`
+    : '未选 = 每天同步（点击选择星期）';
+}
+
 function renderShares(list) {
   const body = $('shareBody');
   body.innerHTML = '';
@@ -604,6 +680,10 @@ function renderShares(list) {
     const urlIsArr = Array.isArray(obj.url);
     const urlText = urlIsArr ? obj.url.join('\n') : (obj.url || '');
     const days = normDays(obj.updateDays);
+    const wdText = wdSummary(days);
+    const wdTitle = days.length
+      ? `每周${days.map(d => WD_LABELS[d - 1]).join('、')}更新（点击修改）`
+      : '未选 = 每天同步（点击选择星期）';
 
     const tr = document.createElement('tr');
     tr.className = 'share-row';
@@ -612,10 +692,18 @@ function renderShares(list) {
       <td><input type="text" data-f="tip" value="${esc(obj.tip)}" placeholder="如：遮天"></td>
       <td><textarea rows="${urlIsArr ? 3 : 1}" data-f="url"
             placeholder="https://pan.quark.cn/s/xxxxxx&#10;（换行填写多个即为备用链接组）">${esc(urlText)}</textarea></td>
-      <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="如：1234"></td>
-      <td class="wd-cell">${WD_LABELS.map((lbl, i) =>
-        `<label title="周${lbl}"><input type="checkbox" data-day="${i + 1}"${days.includes(i + 1) ? ' checked' : ''}>${lbl}</label>`
-      ).join('')}</td>
+      <td><input type="text" data-f="password" value="${esc(obj.password)}" placeholder="提取码"></td>
+      <td class="wd-cell">
+        <button type="button" class="wd-btn${days.length === 0 ? ' empty' : ''}" data-act="wd" title="${esc(wdTitle)}">
+          <span class="sum">${esc(wdText)}</span><span class="caret">▾</span>
+        </button>
+        <div class="wd-pop" hidden>
+          ${WD_LABELS.map((lbl, i) =>
+            `<label><input type="checkbox" data-day="${i + 1}"${days.includes(i + 1) ? ' checked' : ''}>周${lbl}</label>`
+          ).join('')}
+          <div class="wd-ft"><button type="button" data-act="wd-clear">清空（每天）</button></div>
+        </div>
+      </td>
       <td><input type="text" data-f="hours" value="${esc(obj.hours)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="minFileSizeMB" value="${esc(obj.minFileSizeMB)}" placeholder="继承"></td>
       <td><input type="number" min="0" data-f="maxFilesPerShare" value="${esc(obj.maxFilesPerShare)}" placeholder="继承"></td>
@@ -630,6 +718,15 @@ function renderShares(list) {
       tr.remove();
       if ($('shareBody').querySelectorAll('tr.share-row').length === 0) renderShares([]);
       else renumber();
+    };
+    // 周几下拉：点按钮开关、勾选即时更新摘要与「今天」标签、清空 = 每天
+    tr.querySelector('[data-act=wd]').onclick = e => { e.stopPropagation(); toggleWdPop(tr); };
+    const wdPop = tr.querySelector('.wd-pop');
+    wdPop.addEventListener('change', () => { updateWdSummary(tr); renumber(); });
+    wdPop.querySelector('[data-act=wd-clear]').onclick = () => {
+      wdPop.querySelectorAll('[data-day]').forEach(el => { el.checked = false; });
+      updateWdSummary(tr);
+      renumber();
     };
     // 输入时实时刷新「备用组」标记与文本框高度
     const urlEl = tr.querySelector('[data-f=url]');
@@ -695,6 +792,8 @@ function updateShareCount() {
 // 分享表格筛选：只隐藏不匹配的行，不重新渲染 —— 重新渲染会丢掉用户尚未保存的编辑。
 // 匹配影视名称与链接两列，空关键字即全部显示。
 function applyShareFilter() {
+  // 隐藏行时把周几下拉一起收起，避免面板悬在空处
+  closeWdPops();
   const box = $('shareFilter');
   const kw = (box ? box.value : '').trim().toLowerCase();
   $('shareBody').querySelectorAll('tr.share-row').forEach(tr => {
@@ -883,10 +982,14 @@ async function loadConfig() {
 
 $('addShare').onclick = () => addShare();
 $('shareFilter').addEventListener('input', applyShareFilter);
-// 勾选 / 取消周几后立即重算「今天」标记（不必等保存或下一次输入）
-$('shareBody').addEventListener('change', e => {
-  if (e.target && e.target.matches && e.target.matches('[data-day]')) renumber();
+// 周几下拉是 fixed 定位的浮层：点面板外、按 Esc、滚动/缩放窗口都要收起，
+// 否则面板会脱离按钮悬在页面上（滚动用捕获监听，tablewrap 内部滚动也能收到）
+document.addEventListener('click', e => {
+  if (!e.target || !e.target.closest || !e.target.closest('.wd-cell')) closeWdPops();
 });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeWdPops(); });
+document.addEventListener('scroll', () => closeWdPops(), true);
+window.addEventListener('resize', () => closeWdPops());
 $('reloadBtn').onclick = async () => {
   try { await loadConfig(); notify('已重新载入', true); }
   catch (e) { notify(e.message, false); }
